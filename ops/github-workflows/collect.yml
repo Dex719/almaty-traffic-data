@@ -1,0 +1,38 @@
+name: Collect traffic
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # каждые 30 минут (GitHub может задерживать до ~15 мин)
+  workflow_dispatch:
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet httpx
+      - name: Замер
+        run: python -m collector
+      - name: Коммит данных
+        run: |
+          git config user.name "traffic-bot"
+          git config user.email "traffic-bot@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "изменений нет"; exit 0
+          fi
+          git commit -m "data: замер $(TZ=Asia/Almaty date +'%Y-%m-%d %H:%M') (алматинское)"
+          # параллельный ручной запуск мог успеть закоммитить — подтягиваемся
+          git pull --rebase
+          git push
