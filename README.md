@@ -35,17 +35,9 @@ python -m pytest tests/ -q   # оффлайн-тесты
 
 ## Расписание
 
-GitHub Actions, каждые 30 минут: **`ops/github-workflows/collect.yml`**.
+GitHub Actions, каждые 30 минут: **`.github/workflows/collect.yml`**.
 
-⚠️ После первого пуша файл нужно один раз перенести руками (у бота нет
-права писать в `.github/workflows/`):
-
-```bash
-git mv ops/github-workflows/collect.yml .github/workflows/collect.yml
-git commit -m "ci: включить сбор по расписанию" && git push
-```
-
-Дальше всё само: workflow снимает замер и коммитит diff. Ручной запуск —
+Всё само: workflow снимает замер и коммитит diff. Ручной запуск —
 кнопка Run workflow (workflow_dispatch). Расход Actions ≈ 1 мин × 48
 запусков/день ≈ 1 500 мин/мес — впритык к бесплатным 2 000 мин приватных
 репо; если станет тесно, репо можно сделать публичным (данные и так
