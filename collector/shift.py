@@ -1,0 +1,171 @@
+"""Вахта: непрерывный цикл замеров внутри одного GitHub Actions джоба.
+
+Запуск: ``python -m collector.shift --minutes 340``.
+
+Каденции (потолки полезности источников):
+* 2ГИС балл — каждую минуту (сервис пересчитывает ~раз в 1–2 мин);
+* Яндекс балл — каждые 4 минуты (пересчёт ~раз в 4 мин);
+* события 2ГИС (ДТП/ремонты/перекрытия) — каждые 5 минут.
+
+Строка в CSV пишется на каждый минутный тик; поля источников, чей черёд
+не настал, остаются пустыми (пустое = «не замеряли», а не «ноль»).
+
+Устойчивость на месяцы:
+* джиттер ±15 сек на каждом тике — не долбим сервисы по ровным секундам;
+* fail-soft: упавший источник получает кулдаун (после 3 подряд ошибок —
+  пауза 10 минут именно для него), остальные работают;
+* git-коммит пачкой каждые COMMIT_EVERY минут с pull --rebase и ретраями;
+* по завершении вахты финальный коммит делает вызывающий workflow,
+  он же диспатчит следующую вахту.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import random
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from collector import sources, store
+
+logger = logging.getLogger("collector.shift")
+
+REPO_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_DIR / "data"
+
+DGIS_EVERY_MIN = 1
+YANDEX_EVERY_MIN = 4
+EVENTS_EVERY_MIN = 5
+COMMIT_EVERY_MIN = 15
+
+FAILS_TO_COOLDOWN = 3
+COOLDOWN_MIN = 10
+
+
+class SourceGuard:
+    """Считает подряд идущие ошибки источника и выдаёт кулдаун."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.fails = 0
+        self.cooldown_until = 0.0
+
+    def ready(self, now: float) -> bool:
+        return now >= self.cooldown_until
+
+    def ok(self) -> None:
+        self.fails = 0
+
+    def fail(self, now: float) -> None:
+        self.fails += 1
+        if self.fails >= FAILS_TO_COOLDOWN:
+            self.cooldown_until = now + COOLDOWN_MIN * 60
+            self.fails = 0
+            logger.warning("%s: %d ошибок подряд — кулдаун %d мин",
+                           self.name, FAILS_TO_COOLDOWN, COOLDOWN_MIN)
+
+
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=REPO_DIR, capture_output=True, text=True
+    )
+
+
+def commit_and_push() -> None:
+    """Коммитит data/ и пушит с ретраями. Ошибки не валят вахту."""
+    _git("add", "data")
+    diff = _git("diff", "--cached", "--quiet")
+    if diff.returncode == 0:
+        return
+    stamp = datetime.now(store.ALMATY_TZ).strftime("%Y-%m-%d %H:%M")
+    _git("commit", "-m", f"data: вахта, срез {stamp} (алматинское)")
+    for attempt in range(3):
+        _git("pull", "--rebase")
+        push = _git("push")
+        if push.returncode == 0:
+            return
+        logger.warning("push не прошёл (попытка %d): %s",
+                       attempt + 1, push.stderr.strip()[-200:])
+        time.sleep(5 + attempt * 10)
+    logger.error("push не удался трижды — данные останутся до следующего среза")
+
+
+def run_shift(minutes: int, data_dir: Path = DATA_DIR) -> int:
+    guards = {
+        "yandex": SourceGuard("Яндекс"),
+        "dgis": SourceGuard("2ГИС балл"),
+        "events": SourceGuard("2ГИС события"),
+    }
+    deadline = time.monotonic() + minutes * 60
+    tick = 0
+    rows = 0
+    while time.monotonic() < deadline:
+        tick_started = time.monotonic()
+        now = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+
+        yandex = dgis = None
+        events = None
+        want_yandex = tick % YANDEX_EVERY_MIN == 0 and guards["yandex"].ready(now)
+        want_events = tick % EVENTS_EVERY_MIN == 0 and guards["events"].ready(now)
+        want_dgis = tick % DGIS_EVERY_MIN == 0 and guards["dgis"].ready(now)
+
+        if want_yandex:
+            try:
+                yandex = sources.fetch_yandex_score()
+                guards["yandex"].ok()
+            except Exception as exc:
+                guards["yandex"].fail(now)
+                logger.warning("Яндекс-балл: %s", exc)
+        if want_dgis:
+            try:
+                dgis = sources.fetch_dgis_score()
+                guards["dgis"].ok()
+            except Exception as exc:
+                guards["dgis"].fail(now)
+                logger.warning("2ГИС-балл: %s", exc)
+        if want_events:
+            try:
+                events = sources.fetch_dgis_events()
+                guards["events"].ok()
+            except Exception as exc:
+                guards["events"].fail(now)
+                logger.warning("события 2ГИС: %s", exc)
+
+        if yandex is not None or dgis is not None or events is not None:
+            store.append_score_row(
+                data_dir, now_utc, yandex, dgis, events, monthly=True
+            )
+            rows += 1
+        if events is not None:
+            store.update_event_registry(data_dir, now_utc, events)
+            store.append_snapshot(data_dir, now_utc, events)
+
+        if tick > 0 and tick % COMMIT_EVERY_MIN == 0:
+            commit_and_push()
+
+        tick += 1
+        # до следующей минуты с джиттером ±15 сек, но не короче 20 сек
+        elapsed = time.monotonic() - tick_started
+        time.sleep(max(20.0, 60.0 - elapsed + random.uniform(-15, 15)))
+
+    commit_and_push()
+    logger.info("вахта закончена: тиков %d, строк %d", tick, rows)
+    return 0
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
+    parser = argparse.ArgumentParser(description="вахта сборщика")
+    parser.add_argument("--minutes", type=int, default=340)
+    args = parser.parse_args()
+    return run_shift(args.minutes)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
