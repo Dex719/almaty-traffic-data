@@ -141,3 +141,49 @@ def test_snapshot_appends(tmp_path: Path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
+
+
+def test_monthly_score_row(tmp_path):
+    """Вахтовый режим пишет в data/scores/YYYY-MM.csv по алматинскому времени."""
+    from datetime import datetime, timezone
+
+    from collector import store
+
+    now = datetime(2026, 8, 31, 20, 30, tzinfo=timezone.utc)  # 01:30 1 сент Алматы
+    row = store.append_score_row(tmp_path, now, None, {"score": 3}, None, monthly=True)
+    path = tmp_path / "scores" / "2026-09.csv"
+    assert path.exists()
+    assert row["ts_almaty"].startswith("2026-09-01")
+    assert "yandex_score" in path.read_text()
+
+
+def test_monthly_registry_carries_first_seen(tmp_path):
+    """Событие, пережившее границу месяца, сохраняет first_seen из прошлого файла."""
+    import json
+    from datetime import datetime, timezone
+
+    from collector import store
+
+    ev = {"id": "e1", "type": "crash", "lat": 43.2, "lon": 76.9}
+    aug = datetime(2026, 8, 31, 10, 0, tzinfo=timezone.utc)
+    sep = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+    store.update_event_registry(tmp_path, aug, [ev], monthly=True)
+    store.update_event_registry(tmp_path, sep, [ev], monthly=True)
+    new = json.loads((tmp_path / "events" / "2026-09.json").read_text())
+    old = json.loads((tmp_path / "events" / "2026-08.json").read_text())
+    assert new["e1"]["first_seen"] == old["e1"]["first_seen"]
+    assert new["e1"]["last_seen"].startswith("2026-09-01")
+
+
+def test_shift_guard_cooldown():
+    """3 ошибки подряд включают кулдаун, успех сбрасывает счётчик."""
+    from collector.shift import COOLDOWN_MIN, SourceGuard
+
+    g = SourceGuard("test")
+    for _ in range(2):
+        g.fail(100.0)
+    g.ok()
+    for _ in range(3):
+        g.fail(200.0)
+    assert not g.ready(200.0 + COOLDOWN_MIN * 60 - 1)
+    assert g.ready(200.0 + COOLDOWN_MIN * 60 + 1)
