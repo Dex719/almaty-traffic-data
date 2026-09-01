@@ -41,8 +41,14 @@ def append_score_row(
     yandex: dict[str, Any] | None,
     dgis: dict[str, Any] | None,
     events: list[dict[str, Any]] | None,
+    monthly: bool = False,
 ) -> dict[str, Any]:
-    """Дописывает строку замера в scores.csv. Возвращает записанную строку."""
+    """Дописывает строку замера в CSV. Возвращает записанную строку.
+
+    ``monthly=True`` (вахтовый режим) пишет в ``data/scores/YYYY-MM.csv``
+    по алматинскому времени — файлы остаются небольшими на горизонте
+    месяцев. Иначе — легаси ``data/scores.csv``.
+    """
     counts: dict[str, int] = {}
     for event in events or []:
         counts[event["type"]] = counts.get(event["type"], 0) + 1
@@ -60,7 +66,11 @@ def append_score_row(
         "ev_comment": counts.get("comment", 0) if events is not None else "",
         "ev_other": counts.get("other", 0) if events is not None else "",
     }
-    path = data_dir / "scores.csv"
+    if monthly:
+        month = now_utc.astimezone(ALMATY_TZ).strftime("%Y-%m")
+        path = data_dir / "scores" / f"{month}.csv"
+    else:
+        path = data_dir / "scores.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as fh:
@@ -71,21 +81,47 @@ def append_score_row(
     return row
 
 
-def update_event_registry(
-    data_dir: Path, now_utc: datetime, events: list[dict[str, Any]]
-) -> dict[str, int]:
-    """Сливает активные события в реестр events.json.
+def _prev_month(month: str) -> str:
+    year, mon = int(month[:4]), int(month[5:7])
+    if mon == 1:
+        return f"{year - 1}-12"
+    return f"{year}-{mon - 1:02d}"
 
-    Возвращает статистику: сколько новых, сколько продлено, всего в реестре.
+
+def update_event_registry(
+    data_dir: Path,
+    now_utc: datetime,
+    events: list[dict[str, Any]],
+    monthly: bool = False,
+) -> dict[str, int]:
+    """Сливает активные события в реестр.
+
+    ``monthly=True`` — реестр месяца ``data/events/YYYY-MM.json``; событие,
+    пережившее границу месяца, переезжает в новый файл с сохранением
+    ``first_seen`` (ищем карточку и в прошлом месяце). Иначе — легаси
+    ``data/events.json``. Возвращает статистику: новых / активных / всего.
     """
-    path = data_dir / "events.json"
+    if monthly:
+        month = now_utc.astimezone(ALMATY_TZ).strftime("%Y-%m")
+        path = data_dir / "events" / f"{month}.json"
+        prev_path = data_dir / "events" / f"{_prev_month(month)}.json"
+    else:
+        path = data_dir / "events.json"
+        prev_path = None
     registry: dict[str, Any] = {}
     if path.exists():
         registry = json.loads(path.read_text(encoding="utf-8"))
+    prev_registry: dict[str, Any] = {}
+    if prev_path is not None and prev_path.exists():
+        prev_registry = json.loads(prev_path.read_text(encoding="utf-8"))
     stamp = now_utc.strftime("%Y-%m-%dT%H:%M")
     fresh = 0
     for event in events:
         card = registry.get(event["id"])
+        if card is None and prev_registry:
+            old = prev_registry.get(event["id"])
+            if old is not None:
+                card = dict(old)  # переезд через границу месяца
         if card is None:
             card = dict(event)
             card["first_seen"] = stamp
