@@ -187,3 +187,76 @@ def test_shift_guard_cooldown():
         g.fail(200.0)
     assert not g.ready(200.0 + COOLDOWN_MIN * 60 - 1)
     assert g.ready(200.0 + COOLDOWN_MIN * 60 + 1)
+
+
+# --- jam_map: посегментная карта пробок --------------------------------
+
+
+def test_jammap_classify():
+    from collector import jammap
+
+    assert jammap.classify((80, 200, 90, 255)) == "G"
+    assert jammap.classify((255, 190, 60, 255)) == "Y"
+    assert jammap.classify((230, 60, 60, 255)) == "R"
+    assert jammap.classify((120, 20, 30, 255)) == "D"
+    assert jammap.classify((128, 128, 128, 255)) is None  # серый кант
+    assert jammap.classify((230, 60, 60, 100)) is None  # прозрачный
+
+
+def test_jammap_tile_math():
+    from collector import jammap
+
+    grid = jammap.tile_grid()
+    assert 150 < len(grid) < 350  # весь город, z14
+    # эллиптический y Яндекса на широте Алматы больше сферического
+    # на ~12 плиток при z14 — если перепутать проекцию, промахнёмся мимо города
+    import math
+
+    lat = 43.25
+    n = 2**jammap.Z
+    sph = (1 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * n
+    assert 10 < jammap.tile_y(lat) - sph < 14
+
+
+def test_jammap_way_class_voting():
+    from collector import jammap
+
+    class FakeTile:
+        def __init__(self, rgba):
+            self.rgba = rgba
+
+        def getpixel(self, _):
+            return self.rgba
+
+    grid = jammap.tile_grid()
+    tiles = {xy: FakeTile((230, 60, 60, 255)) for xy in grid}
+    pl = [[43.25, 76.90], [43.25, 76.93]]
+    assert jammap.way_class(tiles, pl) == "R"
+    assert jammap.way_class({}, pl) == "-"
+
+
+def test_jammap_harvest_writes_csv(tmp_path, monkeypatch):
+    from collector import jammap
+
+    (tmp_path / "jam_map").mkdir(parents=True)
+    reg = {"ids": [1, 2], "highway": ["primary", "secondary"],
+           "polylines": [[[43.25, 76.90], [43.25, 76.91]],
+                          [[43.30, 76.95], [43.30, 76.96]]]}
+    import json
+
+    (tmp_path / "jam_map" / "ways.json").write_text(json.dumps(reg))
+
+    class FakeTile:
+        def getpixel(self, _):
+            return (80, 200, 90, 255)
+
+    monkeypatch.setattr(jammap, "fetch_tiles",
+                        lambda client=None: {xy: FakeTile() for xy in jammap.tile_grid()})
+    from datetime import datetime, timezone
+
+    stats = jammap.harvest(tmp_path, datetime(2026, 9, 2, 3, 30, tzinfo=timezone.utc))
+    assert stats["covered"] == 2
+    day = tmp_path / "jam_map" / "2026-09-02.csv"
+    rows = day.read_text().strip().splitlines()
+    assert rows[0] == "ts_utc,ts_almaty,covered,classes"
+    assert rows[1].endswith(",2,GG")
