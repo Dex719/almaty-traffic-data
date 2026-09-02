@@ -43,6 +43,15 @@ def collect_once(data_dir: Path = DATA_DIR) -> int:
 
     row = store.append_score_row(data_dir, now_utc, yandex, dgis, events)
     logger.info("scores.csv += %s", row)
+    try:
+        from collector import jammap
+
+        if (data_dir / "jam_map" / "ways.json").exists():
+            logger.info("jam_map: %s", jammap.harvest(data_dir, now_utc))
+    except ImportError:
+        logger.info("jam_map пропущен: нет pillow")
+    except Exception:
+        logger.exception("jam_map не снялся")
     if events is not None:
         stats = store.update_event_registry(data_dir, now_utc, events)
         store.append_snapshot(data_dir, now_utc, events)
