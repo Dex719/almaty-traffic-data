@@ -25,6 +25,7 @@ import argparse
 import logging
 import random
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,7 @@ DATA_DIR = REPO_DIR / "data"
 DGIS_EVERY_MIN = 1
 YANDEX_EVERY_MIN = 4
 EVENTS_EVERY_MIN = 5
+JAMMAP_EVERY_MIN = 5
 COMMIT_EVERY_MIN = 15
 
 FAILS_TO_COOLDOWN = 3
@@ -93,12 +95,36 @@ def commit_and_push() -> None:
     logger.error("push не удался трижды — данные останутся до следующего среза")
 
 
+def _jammap_worker(data_dir: Path, guard: SourceGuard) -> None:
+    """Съёмка всей карты в фоне: ~1 мин работы, минутные тики не ждут."""
+    from collector import jammap
+
+    now_utc = datetime.now(timezone.utc)
+    try:
+        stats = jammap.harvest(data_dir, now_utc)
+        guard.ok()
+        logger.info("jam_map: %s", stats)
+    except Exception as exc:  # noqa: BLE001 - фон не должен ронять вахту
+        guard.fail(time.monotonic())
+        logger.warning("jam_map: %s", exc)
+
+
 def run_shift(minutes: int, data_dir: Path = DATA_DIR) -> int:
     guards = {
         "yandex": SourceGuard("Яндекс"),
         "dgis": SourceGuard("2ГИС балл"),
         "events": SourceGuard("2ГИС события"),
+        "jammap": SourceGuard("карта пробок"),
     }
+    jammap_thread: threading.Thread | None = None
+    jammap_available = (data_dir / "jam_map" / "ways.json").exists()
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        jammap_available = False
+        logger.warning("pillow не установлен — съёмка карты пропускается")
+    if not jammap_available:
+        logger.warning("jam_map выключен (нет реестра или pillow)")
     deadline = time.monotonic() + minutes * 60
     tick = 0
     rows = 0
@@ -144,6 +170,17 @@ def run_shift(minutes: int, data_dir: Path = DATA_DIR) -> int:
             store.update_event_registry(data_dir, now_utc, events)
             store.append_snapshot(data_dir, now_utc, events)
 
+        if (
+            jammap_available
+            and tick % JAMMAP_EVERY_MIN == 0
+            and guards["jammap"].ready(now)
+            and (jammap_thread is None or not jammap_thread.is_alive())
+        ):
+            jammap_thread = threading.Thread(
+                target=_jammap_worker, args=(data_dir, guards["jammap"]), daemon=True
+            )
+            jammap_thread.start()
+
         if tick > 0 and tick % COMMIT_EVERY_MIN == 0:
             commit_and_push()
 
@@ -152,6 +189,8 @@ def run_shift(minutes: int, data_dir: Path = DATA_DIR) -> int:
         elapsed = time.monotonic() - tick_started
         time.sleep(max(20.0, 60.0 - elapsed + random.uniform(-15, 15)))
 
+    if jammap_thread is not None and jammap_thread.is_alive():
+        jammap_thread.join(timeout=120)
     commit_and_push()
     logger.info("вахта закончена: тиков %d, строк %d", tick, rows)
     return 0
