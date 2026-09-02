@@ -46,6 +46,10 @@ COMMIT_EVERY_MIN = 15
 FAILS_TO_COOLDOWN = 3
 COOLDOWN_MIN = 10
 
+GIT_TIMEOUT_SEC = 180          # ни одна git-команда не должна висеть дольше
+PUSH_STALL_MIN = 45            # нет удачного пуша столько минут — вахта сдаётся,
+                               # чтобы workflow поднял свежий раннер
+
 
 class SourceGuard:
     """Считает подряд идущие ошибки источника и выдаёт кулдаун."""
@@ -71,28 +75,44 @@ class SourceGuard:
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=REPO_DIR, capture_output=True, text=True
-    )
+    """git с жёстким таймаутом: зависший push не должен вешать всю вахту."""
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=REPO_DIR, capture_output=True, text=True,
+            timeout=GIT_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("git %s: таймаут %d сек", " ".join(args), GIT_TIMEOUT_SEC)
+        return subprocess.CompletedProcess(
+            ["git", *args], 124, "", f"timeout {GIT_TIMEOUT_SEC}s"
+        )
 
 
-def commit_and_push() -> None:
-    """Коммитит data/ и пушит с ретраями. Ошибки не валят вахту."""
+def commit_and_push() -> bool:
+    """Коммитит data/ и пушит с ретраями. Ошибки не валят вахту.
+
+    Возвращает True, если пушить было нечего или пуш прошёл.
+    """
     _git("add", "data")
     diff = _git("diff", "--cached", "--quiet")
     if diff.returncode == 0:
-        return
+        return True
     stamp = datetime.now(store.ALMATY_TZ).strftime("%Y-%m-%d %H:%M")
     _git("commit", "-m", f"data: вахта, срез {stamp} (алматинское)")
     for attempt in range(3):
-        _git("pull", "--rebase")
+        pull = _git("pull", "--rebase")
+        if pull.returncode != 0:
+            # недоделанный rebase ломает все следующие команды — сбрасываем
+            _git("rebase", "--abort")
+            logger.warning("pull --rebase не прошёл: %s", pull.stderr.strip()[-200:])
         push = _git("push")
         if push.returncode == 0:
-            return
+            return True
         logger.warning("push не прошёл (попытка %d): %s",
                        attempt + 1, push.stderr.strip()[-200:])
         time.sleep(5 + attempt * 10)
     logger.error("push не удался трижды — данные останутся до следующего среза")
+    return False
 
 
 def _jammap_worker(data_dir: Path, guard: SourceGuard) -> None:
@@ -128,6 +148,7 @@ def run_shift(minutes: int, data_dir: Path = DATA_DIR) -> int:
     deadline = time.monotonic() + minutes * 60
     tick = 0
     rows = 0
+    last_push_ok = time.monotonic()
     while time.monotonic() < deadline:
         tick_started = time.monotonic()
         now = time.monotonic()
@@ -182,7 +203,14 @@ def run_shift(minutes: int, data_dir: Path = DATA_DIR) -> int:
             jammap_thread.start()
 
         if tick > 0 and tick % COMMIT_EVERY_MIN == 0:
-            commit_and_push()
+            if commit_and_push():
+                last_push_ok = time.monotonic()
+            elif time.monotonic() - last_push_ok > PUSH_STALL_MIN * 60:
+                logger.error(
+                    "нет удачного пуша %d мин — сдаём вахту, пусть workflow "
+                    "поднимет свежий раннер", PUSH_STALL_MIN,
+                )
+                break
 
         tick += 1
         # до следующей минуты с джиттером ±15 сек, но не короче 20 сек
