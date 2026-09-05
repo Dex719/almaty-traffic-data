@@ -106,7 +106,7 @@ EVENT = {
 def test_score_row_written(tmp_path: Path):
     yandex = {"score": 7, "trend": 1, "jam_length_m": 146883, "ts": 1}
     row = store.append_score_row(tmp_path, NOW, yandex, {"score": 8}, [EVENT])
-    assert row["ts_almaty"] == "2026-08-31T18:00"
+    assert row["ts_almaty"] == "2026-08-31T18:00:00.000000+05:00"
     assert row["yandex_jam_km"] == 146.9
     assert row["ev_crash"] == 1
     with (tmp_path / "scores.csv").open() as fh:
@@ -128,8 +128,8 @@ def test_registry_tracks_lifetime(tmp_path: Path):
     stats = store.update_event_registry(tmp_path, later + timedelta(minutes=30), [])
     assert stats["total"] == 1
     registry = json.loads((tmp_path / "events.json").read_text())
-    assert registry["aaa"]["first_seen"] == "2026-08-31T13:00"
-    assert registry["aaa"]["last_seen"] == "2026-08-31T13:30"
+    assert registry["aaa"]["first_seen"] == "2026-08-31T13:00:00.000000+00:00"
+    assert registry["aaa"]["last_seen"] == "2026-08-31T13:30:00.000000+00:00"
 
 
 def test_snapshot_appends(tmp_path: Path):
@@ -251,7 +251,7 @@ def test_jammap_harvest_writes_csv(tmp_path, monkeypatch):
             return (80, 200, 90, 255)
 
     monkeypatch.setattr(jammap, "fetch_tiles",
-                        lambda client=None: {xy: FakeTile() for xy in jammap.tile_grid()})
+                        lambda client=None, **kwargs: {xy: FakeTile() for xy in jammap.tile_grid()})
     from datetime import datetime, timezone
 
     stats = jammap.harvest(tmp_path, datetime(2026, 9, 2, 3, 30, tzinfo=timezone.utc))

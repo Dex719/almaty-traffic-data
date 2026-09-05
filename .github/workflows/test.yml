@@ -1,0 +1,31 @@
+name: Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - "collector/**"
+      - "tests/**"
+      - "requirements*.txt"
+      - ".github/workflows/test.yml"
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install --requirement requirements-dev.txt
+      - run: python -m pytest tests/ -q
+      - run: python -m compileall -q collector

@@ -1,0 +1,14 @@
+[Unit]
+Description=Verified Almaty traffic database backup
+# Configure an off-host filesystem at this mount point first.
+ConditionPathIsMountPoint=/mnt/traffic-backups
+
+[Service]
+Type=oneshot
+User=traffic
+Group=traffic
+WorkingDirectory=/opt/almaty-traffic-data
+ExecStart=/opt/almaty-traffic-data/.venv/bin/python -m collector.ops backup --data-dir /var/lib/almaty-traffic --destination /mnt/traffic-backups
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/almaty-traffic /mnt/traffic-backups
