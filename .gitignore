@@ -1,3 +1,12 @@
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+**/.state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.tmp-*

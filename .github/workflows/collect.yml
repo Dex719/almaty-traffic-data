@@ -1,19 +1,14 @@
 name: Collect traffic
 
-# Схема «вахта + реаниматор»:
-# * вахта — один джоб живёт ~5ч40м и меряет: 2ГИС каждую минуту,
-#   Яндекс каждые 4 мин, события каждые 5 мин; коммит пачкой раз в 15 мин;
-# * в конце вахта диспатчит следующую (workflow_dispatch через GITHUB_TOKEN —
-#   документированное исключение из запрета на рекурсию);
-# * cron на «кривых» минутах — реаниматор: если цепь порвалась (GitHub убил
-#   раннер, push-гонка, что угодно) — тик поднимает новую вахту. Тики на
-#   :00/:30 GitHub молча выкидывает, поэтому 13,43.
-# * guard не даёт двум вахтам жить одновременно.
-
 on:
   schedule:
-    - cron: "13,43 * * * *" # реаниматор цепи вахт
+    - cron: "13,43 * * * *"
   workflow_dispatch:
+
+# One running collector; a pending successor waits instead of skipping itself.
+concurrency:
+  group: traffic-collector
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -24,37 +19,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - name: Guard — вахта уже идёт?
-        id: guard
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          active=$(gh api "/repos/${{ github.repository }}/actions/runs?per_page=30" \
-            --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }}) \
-                   | select(.status == \"in_progress\" or .status == \"queued\")] | length")
-          echo "active=$active" >> "$GITHUB_OUTPUT"
-          echo "Активных других прогонов: $active"
       - uses: actions/checkout@v4
-        if: steps.guard.outputs.active == '0'
+        with:
+          ref: main
+          fetch-depth: 1
       - uses: actions/setup-python@v5
-        if: steps.guard.outputs.active == '0'
         with:
           python-version: "3.12"
-      - if: steps.guard.outputs.active == '0'
-        run: pip install --quiet httpx pillow
-      - name: Git-идентичность
-        if: steps.guard.outputs.active == '0'
+          cache: pip
+      - run: pip install --requirement requirements.txt
+      - name: Configure publication identity
         run: |
           git config user.name "traffic-bot"
           git config user.email "traffic-bot@users.noreply.github.com"
-      - name: Вахта (~5ч40м)
-        if: steps.guard.outputs.active == '0'
-        run: python -m collector.shift --minutes 340
-      - name: Следующая вахта
-        if: always() && steps.guard.outputs.active == '0'
+      - name: Collect with shutdown margin
+        run: python -m collector.shift --minutes 330 --git
+      - name: Preserve recovery data on failure
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traffic-recovery-${{ github.run_id }}
+          path: data/
+          include-hidden-files: true
+          retention-days: 14
+      - name: Queue successor
+        if: always() && !cancelled()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -X POST \
-            "/repos/${{ github.repository }}/actions/workflows/collect.yml/dispatches" \
-            -f ref=main
+          gh api -X POST "/repos/${{ github.repository }}/actions/workflows/collect.yml/dispatches" -f ref=main

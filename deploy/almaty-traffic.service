@@ -1,0 +1,31 @@
+[Unit]
+Description=Almaty traffic collector
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=traffic
+Group=traffic
+WorkingDirectory=/opt/almaty-traffic-data
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/almaty-traffic.env
+ExecStart=/opt/almaty-traffic-data/.venv/bin/python -m collector.shift --forever --data-dir /var/lib/almaty-traffic
+StateDirectory=almaty-traffic
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=30
+WatchdogSec=180
+TimeoutStopSec=240
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/almaty-traffic
+
+[Install]
+WantedBy=multi-user.target
