@@ -36,7 +36,7 @@ jobs:
         run: python -m collector.shift --minutes 330 --git
       - name: Preserve recovery data on failure
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: traffic-recovery-${{ github.run_id }}
           path: data/
