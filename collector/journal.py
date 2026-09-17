@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from collector.store import atomic_json, utc_stamp
+from collector.store import atomic_json, fsync_directory, utc_stamp
 
 
 def atomic_bytes(path: Path, content: bytes) -> None:
@@ -28,11 +28,7 @@ def atomic_bytes(path: Path, content: bytes) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(name, path)
-        fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        fsync_directory(path.parent)
     finally:
         if name and os.path.exists(name):
             os.unlink(name)
