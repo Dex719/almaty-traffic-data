@@ -126,12 +126,20 @@ def fetch_tiles(client=None, *, grid=None, workers=4, budget=120.0,
 
     tiles = {}
     pool = ThreadPoolExecutor(max_workers=workers)
-    futures = [pool.submit(fetch, xy) for xy in grid]
-    try:
-        for future in as_completed(futures, timeout=max(0.01, budget)):
+
+    def collect(futures, timeout):
+        for future in as_completed(futures, timeout=max(0.01, timeout)):
             xy, image = future.result()
             if image is not None:
                 tiles[xy] = image
+
+    try:
+        collect([pool.submit(fetch, xy) for xy in grid], budget)
+        missing = [xy for xy in grid if xy not in tiles]
+        if missing and not stop.is_set() and time.monotonic() < deadline:
+            # One retry pass: a handful of transient misses must not mark the frame partial.
+            logger.info("retrying %d missing tiles", len(missing))
+            collect([pool.submit(fetch, xy) for xy in missing], deadline-time.monotonic())
     except TimeoutError:
         logger.warning("tile acquisition budget exceeded")
     finally:

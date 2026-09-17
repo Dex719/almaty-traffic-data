@@ -33,7 +33,13 @@ jobs:
           git config user.name "traffic-bot"
           git config user.email "traffic-bot@users.noreply.github.com"
       - name: Collect with shutdown margin
-        run: python -m collector.shift --minutes 330 --git
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # coreutils `timeout` ends a hung collector as a step *failure*, not a job
+        # cancellation: a cancelled job would skip "Queue successor" and break the chain.
+        # SIGTERM at 340 min triggers the graceful final export/publication; SIGKILL 5 min later.
+        run: timeout -k 5m 340m python -m collector.shift --minutes 330 --git
       - name: Preserve recovery data on failure
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4

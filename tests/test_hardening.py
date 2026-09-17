@@ -231,7 +231,8 @@ class HardeningTests(unittest.TestCase):
 
     def test_git_add_failure_is_not_success(self):
         result=subprocess.CompletedProcess([],1,"","failed")
-        with patch.object(shift,"_git",return_value=result) as mock:
+        (self.data/"scores").mkdir()  # a live view must exist for "git add" to be attempted
+        with patch.object(shift,"_git",return_value=result) as mock,              patch.object(shift,"REPO_DIR",self.data.parent):
             self.assertFalse(shift.commit_and_push())
             self.assertEqual(mock.call_count,1)
 
@@ -254,6 +255,30 @@ class HardeningTests(unittest.TestCase):
         with patch.object(shift,"REPO_DIR",work):
             self.assertTrue(shift.commit_and_push())
         self.assertEqual(git(work,"rev-parse","HEAD"),git(base,"--git-dir="+str(remote),"rev-parse","main"))
+
+    def test_missing_tile_is_retried_once(self):
+        buf = io.BytesIO()
+        Image.new("RGBA", (256,256), (80,200,90,255)).save(buf, format="PNG")
+        calls = {}
+        class Client:
+            def get(self, url, **kwargs):
+                x = url.split("&x=")[1].split("&")[0]
+                calls[x] = calls.get(x, 0)+1
+                if x == "0" and calls[x] == 1:
+                    return SimpleNamespace(status_code=500, content=b"")
+                return SimpleNamespace(status_code=200, content=buf.getvalue())
+        tiles = jammap.fetch_tiles(Client(), grid=[(0,0),(1,0)], min_interval=0, workers=1)
+        self.assertEqual(set(tiles), {(0,0),(1,0)})
+        self.assertEqual(calls["0"], 2)
+
+    def test_partial_map_with_high_coverage_is_healthy(self):
+        state = {"jammap": {"interval": 300, "status": "partial", "coverage_ratio": 0.99,
+                            "last_success": store.utc_stamp(NOW)}}
+        self.assertTrue(ops.health_report(state, NOW)["healthy"])
+        state["jammap"]["coverage_ratio"] = 0.8
+        self.assertFalse(ops.health_report(state, NOW)["healthy"])
+        events = {"events_user": {"interval": 300, "status": "partial", "last_success": store.utc_stamp(NOW)}}
+        self.assertFalse(ops.health_report(events, NOW)["healthy"])
 
 
 if __name__ == "__main__":

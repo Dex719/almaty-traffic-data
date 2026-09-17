@@ -1,7 +1,9 @@
 """Independent source schedules, durable observations, graceful shutdown.
 
 Git publication is opt-in (--git), intended only for the best-effort Actions
-fallback. A persistent host uses --forever and a separate backup timer.
+fallback: compact live views go to git, the heavy archive streams go to GitHub
+Releases (see collector.publish). A persistent host uses --forever and a
+separate backup timer.
 """
 from __future__ import annotations
 
@@ -22,12 +24,13 @@ from pathlib import Path
 from collector import sources, store
 from collector.journal import Journal
 from collector.ops import exclusive_collector, health_report, notify_systemd, ping_heartbeat
+from collector.publish import ARCHIVE_PATHS, LIVE_PATHS
 
 logger = logging.getLogger("collector.shift")
 REPO_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_DIR/"data"
 DGIS_EVERY_MIN, YANDEX_EVERY_MIN, EVENTS_EVERY_MIN = 1, 4, 5
-JAMMAP_EVERY_MIN, COMMIT_EVERY_MIN = 5, 15
+JAMMAP_EVERY_MIN, COMMIT_EVERY_MIN, EVENTS_COMMIT_EVERY_MIN = 5, 15, 60
 FAILS_TO_COOLDOWN, COOLDOWN_MIN = 3, 10
 GIT_TIMEOUT_SEC, PUSH_STALL_MIN = 20, 45
 INTERVALS = {"dgis": 60, "yandex": 240, "events_user": 300, "events_2gis": 300, "jammap": 300}
@@ -76,8 +79,14 @@ def _git(*args, timeout=None):
         return subprocess.CompletedProcess(["git", *args], 124, "", "git timeout")
 
 
-def commit_and_push() -> bool:
-    """Never confuse an empty index with a synchronized remote."""
+def commit_and_push(*, include_events: bool = True, drop_archive: bool = False) -> bool:
+    """Publish live views only; never confuse an empty index with a synchronized remote.
+
+    Archive streams travel through Releases (collector.publish). ``drop_archive``
+    removes their historical copies from the index once everything local has
+    been shipped; the files stay on disk. ``include_events`` lets the caller
+    throttle the multi-megabyte event registry to hourly commits.
+    """
     deadline = time.monotonic()+120
     def run(*args):
         remaining = deadline-time.monotonic()
@@ -85,7 +94,11 @@ def commit_and_push() -> bool:
             return subprocess.CompletedProcess(["git", *args], 124, "", "budget exceeded")
         return _git(*args, timeout=min(GIT_TIMEOUT_SEC, remaining))
 
-    if run("add", "--", "data").returncode:
+    live = [path for path in LIVE_PATHS
+            if (include_events or path != "data/events") and (REPO_DIR/path).exists()]
+    if live and run("add", "--", *live).returncode:
+        return False
+    if drop_archive and run("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", *ARCHIVE_PATHS).returncode:
         return False
     diff = run("diff", "--cached", "--quiet")
     if diff.returncode not in (0, 1):
@@ -98,7 +111,9 @@ def commit_and_push() -> bool:
         logger.error("Git publication requires an upstream tracking branch")
         return False
     for attempt in range(3):
-        if run("pull", "--rebase").returncode:
+        # --autostash: unstaged live views (e.g. the registry between hourly commits)
+        # must not block the rebase.
+        if run("pull", "--rebase", "--autostash").returncode:
             run("rebase", "--abort")
         elif run("push").returncode == 0:
             ahead = run("rev-list", "--count", "@{u}..HEAD")
@@ -125,6 +140,10 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
     from collector import jammap
     stop = stop_event or threading.Event()
     journal = Journal(data_dir)
+    publisher = None
+    if git_enabled:
+        from collector.publish import Publisher
+        publisher = Publisher(data_dir)
     guards = {name: SourceGuard(name) for name in INTERVALS}
     states = {name: {"interval": interval, "status": "starting"}
               for name, interval in INTERVALS.items()}
@@ -141,7 +160,7 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
     map_future = None
     successes, fatal, publication_ok = 0, False, True
     next_export, next_health = started+COMMIT_EVERY_MIN*60, started
-    last_push_ok = started
+    last_push_ok, last_events_commit = started, float("-inf")
 
     def record(name, observed, payload=None, error=None):
         nonlocal successes
@@ -168,6 +187,9 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
         journal.record(name, observed, document_payload, status=status, source_ts=source_ts,
                        error=type(error).__name__ if error else None)
         states[name].update(status=status, last_attempt=store.utc_stamp(observed), source_ts=source_ts)
+        if name == "jammap":
+            # Health tolerates a partial map only when the geometry coverage is still high.
+            states[name]["coverage_ratio"] = payload.get("coverage_ratio") if isinstance(payload, dict) else None
         if error is not None:
             guards[name].fail(time.monotonic(), error)
             states[name]["error_code"] = type(error).__name__
@@ -187,6 +209,22 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
             return
         record("jammap", datetime.now(timezone.utc), frame)
         jammap.append_frame(data_dir, frame)
+
+    def publish(final=False):
+        """Segments first (Releases), then live views (git); consolidation in the background."""
+        nonlocal publication_ok, last_push_ok, last_events_commit
+        shipped = publisher.ship() if publisher is not None else True
+        include_events = final or time.monotonic()-last_events_commit >= EVENTS_COMMIT_EVERY_MIN*60
+        drop_archive = publisher.fully_shipped() if publisher is not None else False
+        pushed = commit_and_push(include_events=include_events, drop_archive=drop_archive)
+        if pushed and include_events:
+            last_events_commit = time.monotonic()
+        publication_ok = shipped and pushed
+        if publication_ok:
+            last_push_ok = time.monotonic()
+        if publisher is not None and not final:
+            publisher.maybe_consolidate()
+        return publication_ok
 
     notify_systemd("READY=1")
     try:
@@ -233,13 +271,9 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
             now = time.monotonic()
             if now >= next_export:
                 journal.export_pending()
-                if git_enabled:
-                    publication_ok = commit_and_push()
-                    if publication_ok:
-                        last_push_ok = time.monotonic()
-                    elif time.monotonic()-last_push_ok >= PUSH_STALL_MIN*60:
-                        fatal = True
-                        break
+                if git_enabled and not publish() and time.monotonic()-last_push_ok >= PUSH_STALL_MIN*60:
+                    fatal = True
+                    break
                 next_export = advance_due(next_export, now, COMMIT_EVERY_MIN*60)
             if now >= next_health:
                 report = health_report(states, data_dir=data_dir)
@@ -264,12 +298,14 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
                 save_map(map_future)
             journal.export_pending()
             if git_enabled:
-                publication_ok = commit_and_push()
+                publish(final=True)
             store.atomic_json(data_dir/".state/health.json", health_report(states, data_dir=data_dir))
         except Exception:
             logger.exception("Final persistence/publication failed")
             fatal = True
         finally:
+            if publisher is not None:
+                publisher.close()
             journal.close()
             sources.close_client()
             notify_systemd("STOPPING=1")
@@ -278,13 +314,17 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for noisy in ("httpx", "httpcore"):
+        # One INFO line per request (~14k per shift) buries the collector's own messages.
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--minutes", type=int, default=340)
     mode.add_argument("--forever", action="store_true")
     mode.add_argument("--once", action="store_true")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--git", action="store_true", help="Explicitly enable legacy Git publication")
+    parser.add_argument("--git", action="store_true",
+                        help="Enable GitHub publication: live views to git, archive streams to Releases")
     args = parser.parse_args()
     if not args.forever and args.minutes <= 0:
         parser.error("--minutes must be positive")
