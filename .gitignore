@@ -10,3 +10,6 @@ __pycache__/
 *.sqlite3-wal
 *.sqlite3-shm
 .tmp-*
+data/observations/
+data/snapshots/
+data/jam_map/v2/
