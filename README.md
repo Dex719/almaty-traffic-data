@@ -10,6 +10,28 @@
 в течение года. Данные публикуются открыто, без регистрации и API-ключей, и не
 зависят от условий, форматов и доступности источников.
 
+## English summary
+
+An open, provider-independent dataset of road traffic in Almaty, Kazakhstan:
+Yandex and 2GIS congestion scores every minute, user-reported and official road
+events (crashes, roadworks, closures, driver comments) every five minutes, and a
+categorical jam map on OpenStreetMap road geometries. Providers only show "now";
+this repository keeps a verifiable "always" in its own schema, so the history
+does not depend on any provider's API, terms or availability.
+
+- **Live views** (git, `data/`): monthly score CSVs, monthly event registries,
+  road geometries. `git clone --depth 1 https://github.com/Dex719/almaty-traffic-data.git`
+- **Full history** (GitHub Releases `data-YYYY-MM`): one `traffic-YYYY-MM-DD.tar.xz`
+  per day with the raw observation journal, event snapshots and jam-map classes,
+  plus `MANIFEST.json` with the SHA-256 of every member. Verify downloads against
+  the `digest` field of the GitHub release-assets API. A day is final at
+  `D+1 00:45 UTC`.
+- **Licence**: data CC BY 4.0 (`LICENSE-DATA.md`), code MIT (`LICENSE`).
+  Attribution: *Almaty traffic data, https://github.com/Dex719/almaty-traffic-data, CC BY 4.0.*
+- **Run your own collector**: Python 3.12+, Linux; see «Свой сборщик» below.
+
+The rest of this document is in Russian.
+
 ## Принципы
 
 - **Независимость от провайдеров.** Значения берутся из публичных endpoints
@@ -25,6 +47,8 @@
   не скорость, класс пробки — не время в пути. Ограничения описаны ниже, а не спрятаны.
 - **Воспроизводимость.** Сборщик — открытый код в этом же репозитории; любой
   может запустить свой экземпляр и получить те же файлы.
+- **Открытая лицензия.** Данные — CC BY 4.0 (`LICENSE-DATA.md`), код — MIT
+  (`LICENSE`). Используйте, анализируйте и перепубликуйте со ссылкой на источник.
 
 ## Как получить данные
 
@@ -275,8 +299,18 @@ GH_REPO=Dex719/almaty-traffic-data python -m collector.publish consolidate --dat
 
 ## Лицензия
 
-Цель проекта — открытые данные: свободное использование, анализ и
-перепубликация со ссылкой на источник. Файл `LICENSE` ещё не добавлен; выбор за
-владельцем. Рекомендуемые варианты: ODbL или CC BY 4.0 для данных, MIT для кода.
-До появления файла считайте данные предоставленными «как есть», без гарантий
-полноты и точности.
+- **Данные** (`data/` в git и все активы релизов `data-YYYY-MM`) —
+  [CC BY 4.0](LICENSE-DATA.md): свободное использование, изменение и
+  перепубликация, в том числе коммерческая, с указанием источника.
+  Рекомендуемая атрибуция:
+
+  > Almaty traffic data, https://github.com/Dex719/almaty-traffic-data, CC BY 4.0.
+
+- **Код** сборщика — [MIT](LICENSE).
+
+Лицензия покрывает компиляцию и производные файлы проекта, а не сервисы
+провайдеров: условия Яндекса и 2ГИС продолжают действовать при прямом
+обращении к их сервисам. Комментарии водителей могут содержать персональные
+данные — соблюдение законодательства при повторном использовании лежит на
+пользователе данных. Данные предоставляются «как есть», без гарантий полноты и
+точности; пробелы и частичные наблюдения записаны явно, а не скрыты.
