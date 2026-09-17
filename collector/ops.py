@@ -42,6 +42,16 @@ def notify_systemd(message: str) -> None:
         pass
 
 
+PARTIAL_HEALTHY_COVERAGE = 0.95  # jammap "partial" with this geometry coverage still feeds the heartbeat
+
+
+def _coverage(state: dict) -> float:
+    try:
+        return float(state.get("coverage_ratio") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def health_report(states: dict, now=None, data_dir=None) -> dict:
     now = now or datetime.now(timezone.utc)
     reports = {}
@@ -50,8 +60,9 @@ def health_report(states: dict, now=None, data_dir=None) -> dict:
         last = state.get("last_success")
         age = (now-datetime.fromisoformat(last)).total_seconds() if last else None
         current["age_seconds"] = age
-        current["healthy"] = (age is not None and 0 <= age <= state["interval"]*3
-                              and state["status"] == "ok")
+        status_ok = state["status"] == "ok" or (
+            state["status"] == "partial" and _coverage(state) >= PARTIAL_HEALTHY_COVERAGE)
+        current["healthy"] = age is not None and 0 <= age <= state["interval"]*3 and status_ok
         reports[name] = current
     storage = {"healthy": True}
     if data_dir is not None:
