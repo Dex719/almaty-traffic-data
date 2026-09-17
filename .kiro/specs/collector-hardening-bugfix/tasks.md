@@ -22,6 +22,11 @@
   - Deliverables: `collector/store.py` — модульный докстринг
   - Acceptance: описаны месячные файлы и статус legacy.
 
+- [x] **TSK-B05**: Пропуск fsync каталога на Windows
+  - Bug: BUG-5
+  - Deliverables: `collector/store.py::fsync_directory`, использование в `atomic_json` и `journal.atomic_bytes`, тест в `tests/test_hardening.py`
+  - Acceptance: под `os.name == "nt"` запись успешна без открытия каталога; под POSIX каталог по-прежнему открывается.
+
 ## Progress
 
 | Task | Status |
@@ -30,6 +35,7 @@
 | TSK-B02 | Complete |
 | TSK-B03 | Complete |
 | TSK-B04 | Complete |
+| TSK-B05 | Complete (PR follow-up) |
 
 ## Evidence (2026-09-17)
 

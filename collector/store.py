@@ -195,6 +195,21 @@ def read_json(path: Path) -> dict:
     return copy.deepcopy(_read_cached(str(path.resolve()), stat.st_mtime_ns, stat.st_size))
 
 
+def fsync_directory(path: Path) -> None:
+    """Persist the directory entry after os.replace.
+
+    Windows cannot open a directory (PermissionError) and NTFS has no
+    directory-fsync semantics, so the operator CLI simply skips it there.
+    """
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def atomic_json(path: Path, value: Any) -> None:
     """Replace complete JSON atomically; retain the previous file on failure."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,11 +222,7 @@ def atomic_json(path: Path, value: Any) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_directory(path.parent)
     finally:
         if name and os.path.exists(name):
             os.unlink(name)

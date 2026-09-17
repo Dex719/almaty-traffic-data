@@ -1,7 +1,7 @@
 # Requirements: release-archive-publishing
 
 **Spec Type:** Feature Spec (Requirements → Design → Tasks)
-**Created:** 2026-09-17 · **Owner:** Dex719 · **Status:** Implemented, awaiting merge (PR) → post-cutover TSK-013
+**Created:** 2026-09-17 · **Owner:** Dex719 · **Status:** Merged (PR #6, 2026-09-17 10:10 UTC), cutover complete; NFR-1 verify after 2026-09-20
 
 ## Контекст и проблема
 
@@ -142,7 +142,7 @@
 | FR-1 | Must | Implemented (tests) |
 | FR-2 | Must | Implemented (tests) |
 | FR-3 | Must | Implemented (tests) |
-| FR-4 | Must | Implemented; `.gitignore` после первой вахты (TSK-013) |
+| FR-4 | Must | Implemented; `.gitignore` добавлен оператором раньше плана, cutover выполнен вручную без потерь (см. tasks.md Deviation) |
 | FR-5 | Should | Implemented (tests) |
 | FR-6 | Must | Implemented (tests) |
 | FR-7 | Should | Implemented (tests) |

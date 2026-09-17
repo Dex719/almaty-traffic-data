@@ -2,6 +2,7 @@
 import gzip
 import io
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -279,6 +280,21 @@ class HardeningTests(unittest.TestCase):
         self.assertFalse(ops.health_report(state, NOW)["healthy"])
         events = {"events_user": {"interval": 300, "status": "partial", "last_success": store.utc_stamp(NOW)}}
         self.assertFalse(ops.health_report(events, NOW)["healthy"])
+
+    def test_atomic_write_skips_directory_fsync_only_on_windows(self):
+        real_open = os.open
+        def guard(path, *args, **kwargs):
+            if os.path.isdir(path):
+                raise PermissionError("directories cannot be opened on Windows")
+            return real_open(path, *args, **kwargs)
+        with patch.object(store.os, "name", "nt"), patch.object(store.os, "open", guard):
+            store.atomic_json(self.data/"x.json", {"ok": True})
+            journal.atomic_bytes(self.data/"y.bin", b"ok")
+        self.assertEqual(json.loads((self.data/"x.json").read_text()), {"ok": True})
+        self.assertEqual((self.data/"y.bin").read_bytes(), b"ok")
+        with patch.object(store.os, "name", "posix"), patch.object(store.os, "open", guard):
+            with self.assertRaises(PermissionError):
+                store.atomic_json(self.data/"z.json", {})
 
 
 if __name__ == "__main__":

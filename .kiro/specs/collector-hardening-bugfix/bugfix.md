@@ -1,6 +1,6 @@
 # Bugfix Spec: collector-hardening-bugfix
 
-**Spec Type:** Bugfix Spec · **Created:** 2026-09-17 · **Status:** Fixed, awaiting merge (PR)
+**Spec Type:** Bugfix Spec · **Created:** 2026-09-17 · **Status:** BUG-1..4 merged (PR #6); BUG-5 in progress
 **Источник:** ревью кода и Actions от 2026-09-17 (последняя вахта 35178520994, лог 14 504 строк, 0 WARNING/ERROR).
 
 ## BUG-1 Преемник не ставится в очередь при таймауте джоба
@@ -33,6 +33,14 @@
 - **Expected behavior:** докстринг описывает актуальные пути и статус legacy-файлов.
 - **Unchanged behavior:** код.
 - **Root cause:** докстринг не обновлён при переходе на вахтовый режим.
+
+## BUG-5 Атомарные записи падают на Windows из-за fsync каталога (Micro)
+
+- **Current behavior:** `store.atomic_json` и `journal.atomic_bytes` после `os.replace` открывают каталог через `os.open(dir, O_RDONLY)` для `fsync`; на Windows это `PermissionError`. Операторский CLI `python -m collector.publish` и `Journal.export_pending()` на Windows завершаются трейсбеком уже после того, как файл записан (обнаружено при восстановлении из артефакта 2026-09-17).
+- **Expected behavior:** на `os.name == "nt"` fsync каталога пропускается (NTFS не имеет такой семантики); на POSIX поведение прежнее.
+- **Unchanged behavior:** порядок temp → fsync файла → replace; гарантии на Linux.
+- **Root cause:** Linux-специфичный приём без ветки для Windows в модулях, которые по стандартам проекта должны импортироваться и работать на любой ОС.
+- **Regressions to check:** новый тест `test_atomic_write_skips_directory_fsync_only_on_windows`; `test_atomic_registry_retains_previous_file`, `test_outbox_crash_replays_stable_batch_with_new_observations`.
 
 ## Не в объёме
 
