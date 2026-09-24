@@ -61,7 +61,7 @@ class ReleaseClient(Protocol):            # реализация GhReleases; в 
     def list_assets(self, tag) -> dict[str, AssetInfo]          # name -> {id,size,digest,state}
     def upload(self, tag, path: Path) -> None                    # без --clobber
     def download(self, tag, name, dest_dir: Path) -> Path
-    def delete_asset(self, tag, name) -> None
+    def delete_asset(self, tag, name, asset_id=None) -> None    # по id через REST: gh не видит starter
 
 class GhReleases(ReleaseClient):          # subprocess gh, env GH_TOKEN/GH_REPO, timeout 120 c
 class FakeReleases(ReleaseClient):        # tests/: dict tag -> name -> bytes, эмуляция digest
@@ -75,7 +75,7 @@ class Consolidator:
     def __init__(self, data_dir, releases, run_id, *, consolidated, lock)
     def candidate_days(self, now_utc) -> list[str]   # закрытые, неконсолидированные
     def consolidate_day(self, day, workdir) -> dict   # build → upload → verify
-    def cleanup_staging(self) -> int
+    def cleanup_staging(self, now_utc) -> int       # + незавершённые активы старше ORPHAN_AGE
     def run(self, now_utc) -> dict                    # все кандидаты, ошибки логируются
 
 class Publisher:                          # фасад для shift.py
@@ -161,7 +161,7 @@ class Publisher:                          # фасад для shift.py
 5. Успех → обновить `shipped`, `seq`, сохранить `publish.json`, удалить временный файл → `True`. Неуспех → удалить временный файл → `False`.
 
 ### Consolidator.run
-1. `list_assets(staging)` → сегменты (имя → дни, run_id, время). `local_days` из файлов на диске.
+1. `list_assets(staging)` → сегменты только в состоянии `uploaded` (имя → дни, run_id, время). `local_days` из файлов на диске.
 2. Кандидаты: закрытые дни без актива в месячном релизе, по возрастанию.
 3. Для дня D: скачать сегменты D других run во временный каталог, прочитать manifests; для текущего run — локальные файлы как единый диапазон `[0,size)`.
 4. Сборка: для батчей — dedupe по пути, проверка sha256 при `whole`, распаковка gzip; для append-only — группировать по run (порядок по времени первого сегмента run, текущий run последний), внутри run сортировать по offset, отбрасывать дубликаты диапазонов, фиксировать разрывы; конкатенация; построчная дедупликация с сохранением первого вхождения (заголовок CSV — обычная строка, поэтому повтор заголовка отбрасывается).
@@ -179,7 +179,10 @@ class Publisher:                          # фасад для shift.py
 | `gh` не найден / `GH_TOKEN` пуст | `ship` → `False`; публикация неуспешна; стагнация 45 мин → код 1 | ERROR в логе |
 | Таймаут `gh` (120 с) | попытка неуспешна, повтор в следующем цикле | WARNING |
 | digest не совпал | удалить актив, `False` | ERROR |
-| Актив уже существует (`starter`/другой размер) | удалить и загрузить заново | INFO |
+| Актив уже существует (`starter`/другой размер) | удалить по id через REST (`gh` не видит `starter`) и загрузить заново | INFO |
+| Незавершённый актив в `staging` | не участвует в сборке; удаляется по id через `ORPHAN_AGE` (1 ч); сбой удаления не прерывает очистку | ERROR при сбое удаления |
+| День не собран за `STUCK_AFTER` (24 ч) после закрытия | один раз за процесс ERROR и `::error::` | аннотация на странице run |
+| `ship` для уже собранного дня | файлы не отгружаются, `refused_days`, код 1 | ERROR |
 | Ошибка сборки дня | день пропущен, повтор позже | ERROR (exception) |
 | Разрыв смещений | архив собран, `gaps` в MANIFEST | WARNING |
 | Дубликаты строк/диапазонов | отброшены, счётчик в MANIFEST | INFO |
