@@ -52,6 +52,23 @@ class HardeningTests(unittest.TestCase):
         registry = json.loads((self.data/"events/2026-09.json").read_text())
         self.assertEqual(set(registry), {"user:same", "2gis:same"})
 
+    def test_mutable_registry_is_not_retained_in_cache(self):
+        store.update_event_registry(self.data, NOW-timedelta(days=1), [{k: v for k, v in EVENT.items() if k != "key"}])
+        store._read_cached.cache_clear()
+        events = []
+        for i in range(4):   # every write changes the monthly file: a cached copy could never be hit again
+            events.append(dict(EVENT, id=f"e{i}", key=f"user:e{i}"))
+            store.update_event_registry(self.data, NOW+timedelta(minutes=5*i), events, monthly=True)
+        self.assertLessEqual(store._read_cached.cache_info().currsize, 1, "only the frozen legacy registry")
+
+    def test_frozen_registries_are_not_mutated_through_the_cache(self):
+        store.update_event_registry(self.data, NOW-timedelta(days=1), [{k: v for k, v in EVENT.items() if k != "key"}])
+        before = json.loads((self.data/"events.json").read_text())
+        store.update_event_registry(self.data, NOW, [dict(EVENT, comment="new", segment=[[76.9, 43.25]])], monthly=True)
+        store.update_event_registry(self.data, NOW+timedelta(minutes=5), [dict(EVENT, comment="newer")], monthly=True)
+        self.assertEqual(store.read_frozen_json(self.data/"events.json"), before)
+        self.assertEqual(json.loads((self.data/"events/2026-09.json").read_text())["user:same"]["comment"], "newer")
+
     def test_snapshot_deduplicates_and_marks_partial(self):
         path = store.append_snapshot(self.data, NOW, [EVENT, EVENT], complete=False, layers=["user"])
         row = json.loads(path.read_text())
