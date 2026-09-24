@@ -121,11 +121,12 @@ def update_event_registry(
     registry: dict[str, Any] = {}
     if path.exists():
         registry = read_json(path)
+    # Previous month and legacy are frozen: shared cached objects, cards copied below.
     prev_registry: dict[str, Any] = {}
     if prev_path is not None and prev_path.exists():
-        prev_registry = read_json(prev_path)
+        prev_registry = read_frozen_json(prev_path)
     legacy_path = data_dir / "events.json"
-    legacy = read_json(legacy_path) if monthly and legacy_path.exists() else {}
+    legacy = read_frozen_json(legacy_path) if monthly and legacy_path.exists() else {}
     stamp = utc_stamp(now_utc)
     fresh = 0
     for event in events:
@@ -189,10 +190,16 @@ def _read_cached(path: str, mtime_ns: int, size: int) -> dict:
 
 
 def read_json(path: Path) -> dict:
+    """Private mutable copy. Never cached: the monthly registry changes on every
+    write, so a cache would only retain dead parsed versions of a multi-MB file."""
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_frozen_json(path: Path) -> dict:
+    """Shared cached object of a file that no longer changes (legacy registry,
+    previous month). Callers must copy a card before modifying it."""
     stat = path.stat()
-    # Callers mutate cards: never expose the cached object itself.
-    import copy
-    return copy.deepcopy(_read_cached(str(path.resolve()), stat.st_mtime_ns, stat.st_size))
+    return _read_cached(str(path.resolve()), stat.st_mtime_ns, stat.st_size)
 
 
 def fsync_directory(path: Path) -> None:
