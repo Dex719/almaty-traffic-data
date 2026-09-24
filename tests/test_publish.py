@@ -1,11 +1,14 @@
 """Offline tests for Releases publication: a fake client, no GitHub access, real local git."""
 import gzip
 import hashlib
+import io
 import json
+import os
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -21,7 +24,13 @@ OPEN = datetime(2026, 9, 16, 23, 0, tzinfo=timezone.utc)
 
 
 class FakeReleases:
-    """In-memory GitHub Releases with the digest semantics of the REST API."""
+    """In-memory GitHub Releases with the digest and asset-state semantics of the real service.
+
+    An interrupted upload stays in the REST asset listing as ``state="starter"`` without
+    a digest, but ``gh release download`` and ``gh release delete-asset`` resolve names
+    through the release object, which omits it. Deleting by id through REST works for
+    any state.
+    """
 
     def __init__(self):
         self.releases = {}
@@ -29,6 +38,9 @@ class FakeReleases:
         self.deleted = []
         self.corrupt_digest = False
         self.fail_upload = False
+        self.interrupt_at = None          # next upload dies midway, as with a gh timeout
+        self.fail_delete = set()
+        self.states, self.created, self.ids, self.next_id = {}, {}, {}, 0
 
     def ensure_release(self, tag, title, notes, prerelease=False):
         self.releases.setdefault(tag, {"prerelease": prerelease, "title": title, "assets": {}})
@@ -39,8 +51,10 @@ class FakeReleases:
             return {}
         out = {}
         for name, data in release["assets"].items():
-            digest = "0"*64 if self.corrupt_digest else hashlib.sha256(data).hexdigest()
-            out[name] = AssetInfo(name, len(data), digest, "uploaded", 1)
+            state = self.states.get(name, "uploaded")
+            digest = None if state != "uploaded" else "0"*64 if self.corrupt_digest else hashlib.sha256(data).hexdigest()
+            extra = {"created_at": self.created[name]} if name in self.created else {}
+            out[name] = AssetInfo(name, len(data), digest, state, self.ids[name], **extra)
         return out
 
     def upload(self, tag, path):
@@ -51,17 +65,36 @@ class FakeReleases:
         if path.name in assets:
             raise publish.GhError("asset already exists")
         assets[path.name] = path.read_bytes()
+        self.next_id += 1
+        self.ids[path.name] = self.next_id
+        if self.interrupt_at is not None:
+            self.states[path.name] = "starter"
+            self.created[path.name] = self.interrupt_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.interrupt_at = None
+            raise publish.GhError("gh timeout: release upload")
         self.uploads += 1
 
+    def visible_to_gh(self, tag, name):
+        return name in self.releases.get(tag, {"assets": {}})["assets"] and self.states.get(name, "uploaded") == "uploaded"
+
     def download(self, tag, name, dest_dir):
+        if not self.visible_to_gh(tag, name):
+            raise publish.GhError("gh release download failed (1): no assets match the file pattern")
         dest = Path(dest_dir)
         dest.mkdir(parents=True, exist_ok=True)
         target = dest/name
         target.write_bytes(self.releases[tag]["assets"][name])
         return target
 
-    def delete_asset(self, tag, name):
+    def delete_asset(self, tag, name, asset_id=None):
+        if name in self.fail_delete:
+            raise publish.GhError("simulated HTTP 500")
+        if asset_id is None and not self.visible_to_gh(tag, name):
+            raise publish.GhError(f"asset {name} not found in release {tag}")
+        if asset_id is not None and self.ids.get(name) != asset_id:
+            raise publish.GhError("HTTP 404: Not Found")
         del self.releases[tag]["assets"][name]
+        self.states.pop(name, None)
         self.deleted.append(name)
 
     def names(self, tag):
@@ -293,6 +326,69 @@ class ConsolidatorTests(unittest.TestCase):
         self.assertEqual(manifest["partial_lines_dropped"], 1)
         self.assertEqual(manifest["duplicates_dropped"], 1)
 
+    def test_interrupted_segment_upload_does_not_block_consolidation(self):
+        run_a = self.run_dir("a")
+        append(run_a, f"snapshots/2026-09/16.jsonl", '{"t":1}\n')
+        shipper = Shipper(run_a, self.releases, "runA")
+        self.releases.interrupt_at = CLOSED-timedelta(hours=5)
+        self.assertFalse(shipper.ship(CLOSED-timedelta(hours=5)))
+        append(run_a, f"snapshots/2026-09/16.jsonl", '{"t":2}\n')
+        self.assertTrue(shipper.ship(CLOSED-timedelta(hours=4, minutes=45)), "retry: new name, same bytes")
+        summary = Consolidator(self.run_dir("c"), self.releases, "runC").run(CLOSED)
+        self.assertEqual(summary["consolidated"], [DAY])
+        members = read_archive(self.releases.releases[month_tag(DAY)]["assets"][day_asset(DAY)])
+        self.assertEqual(members[f"snapshots/{DAY}.jsonl"], b'{"t":1}\n{"t":2}\n')
+        self.assertEqual(self.releases.names(STAGING_TAG), [], "retried segment consolidated, orphan deleted")
+
+    def test_orphaned_upload_deleted_only_after_grace_period(self):
+        run_a = self.run_dir("a")
+        append(run_a, f"jam_map/v2/{NEXT}.csv", "n\n")
+        self.releases.interrupt_at = CLOSED-timedelta(minutes=10)
+        self.assertFalse(Shipper(run_a, self.releases, "runA").ship(CLOSED-timedelta(minutes=10)))
+        consolidator = Consolidator(self.run_dir("c"), self.releases, "runC")
+        self.assertEqual(consolidator.cleanup_staging(CLOSED), 0, "young: the upload may still be running")
+        self.assertEqual(len(self.releases.names(STAGING_TAG)), 1)
+        self.assertEqual(consolidator.cleanup_staging(CLOSED+timedelta(hours=1)), 1)
+        self.assertEqual(self.releases.names(STAGING_TAG), [])
+
+    def test_cleanup_continues_after_failed_deletion(self):
+        run_a = self.run_dir("a")
+        shipper = Shipper(run_a, self.releases, "runA")
+        append(run_a, f"jam_map/v2/{DAY}.csv", "a\n")
+        self.assertTrue(shipper.ship(CLOSED-timedelta(hours=2)))
+        append(run_a, f"jam_map/v2/{DAY}.csv", "b\n")
+        self.assertTrue(shipper.ship(CLOSED-timedelta(hours=1)))
+        first, second = self.releases.names(STAGING_TAG)
+        self.releases.fail_delete.add(first)
+        summary = Consolidator(self.run_dir("c"), self.releases, "runC").run(CLOSED)
+        self.assertEqual(summary["consolidated"], [DAY])
+        self.assertEqual(summary["deleted_segments"], 1)
+        self.assertEqual(self.releases.names(STAGING_TAG), [first])
+
+    def test_stale_daily_archive_in_starter_state_is_replaced(self):
+        local = self.run_dir("c")
+        append(local, f"jam_map/v2/{DAY}.csv", "h\n")
+        consolidator = Consolidator(local, self.releases, "runC")
+        self.releases.interrupt_at = CLOSED
+        self.assertEqual(consolidator.run(CLOSED)["failed"], [DAY])
+        self.assertEqual(self.releases.list_assets(month_tag(DAY))[day_asset(DAY)].state, "starter")
+        self.assertEqual(consolidator.run(CLOSED)["consolidated"], [DAY])
+        self.assertEqual(self.releases.list_assets(month_tag(DAY))[day_asset(DAY)].state, "uploaded")
+
+    def test_stuck_day_is_annotated_once(self):
+        local = self.run_dir("c")
+        append(local, f"jam_map/v2/{DAY}.csv", "h\n")
+        consolidator = Consolidator(local, self.releases, "runC")
+        self.releases.fail_upload = True
+        out = io.StringIO()
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(out):
+            consolidator.run(CLOSED)                          # closed 15 minutes ago: not stuck yet
+            consolidator.run(CLOSED+timedelta(hours=25))
+            consolidator.run(CLOSED+timedelta(hours=26))
+        annotations = [line for line in out.getvalue().splitlines() if line.startswith("::error")]
+        self.assertEqual(len(annotations), 1)
+        self.assertIn(DAY, annotations[0])
+
 
 class PublisherTests(unittest.TestCase):
     def test_background_consolidation_runs_once_at_a_time(self):
@@ -329,6 +425,54 @@ class GhClientTests(unittest.TestCase):
         self.assertNotIn("ghs_", str(ctx.exception))
         self.assertTrue(all(repo == "Dex719/almaty-traffic-data" for _, repo in seen))
         self.assertEqual(seen[-1][0][:4], ["gh", "release", "upload", "staging"])
+
+    def test_delete_asset_goes_by_id_through_rest(self):
+        seen = []
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd)
+            if "tags/" in cmd[-1]:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": 5}), "")
+            if cmd[-1].endswith("assets?per_page=100"):
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([[{
+                    "name": "a", "size": 3, "digest": None, "state": "starter", "id": 9,
+                    "created_at": "2026-09-17T20:07:33Z"}]]), "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            client = publish.GhReleases(repo="Dex719/almaty-traffic-data")
+            self.assertEqual(client.list_assets("staging")["a"].created_at, "2026-09-17T20:07:33Z")
+            client.delete_asset("staging", "a", 7)
+            self.assertEqual(seen[-1], ["gh", "api", "-X", "DELETE", "repos/{owner}/{repo}/releases/assets/7"])
+            client.delete_asset("staging", "a")        # looked up in the listing, which includes starter assets
+            self.assertEqual(seen[-1], ["gh", "api", "-X", "DELETE", "repos/{owner}/{repo}/releases/assets/9"])
+
+
+class CliTests(unittest.TestCase):
+    def test_ship_refuses_days_already_archived(self):
+        now = datetime.now(timezone.utc)
+        archived, today = (now-timedelta(days=3)).date().isoformat(), now.date().isoformat()
+        releases = FakeReleases()
+        with tempfile.TemporaryDirectory() as tmp:
+            first, recovery = Path(tmp)/"first", Path(tmp)/"recovery"
+            append(first, f"jam_map/v2/{archived}.csv", "early\n")
+            self.assertEqual(Consolidator(first, releases, "runA").run(now)["consolidated"], [archived])
+            append(recovery, f"jam_map/v2/{archived}.csv", "late\n")
+            append(recovery, f"jam_map/v2/{today}.csv", "fresh\n")
+            out = io.StringIO()
+            with patch.object(publish, "GhReleases", return_value=releases), redirect_stdout(out):
+                code = publish.main(["ship", "--data-dir", str(recovery), "--run-id", "recovery_1"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())["refused_days"], [archived])
+        shipped = [parse_segment_name(name).days for name in releases.names(STAGING_TAG)]
+        self.assertEqual(shipped, [(today,)], "only the open day was shipped")
+
+    def test_rejects_run_id_that_breaks_segment_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(publish, "GhReleases", return_value=FakeReleases()), redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as ctx:
+                publish.main(["status", "--data-dir", tmp, "--run-id", "recovery-1"])
+            self.assertEqual(ctx.exception.code, 2)
+            with self.assertRaises(ValueError):
+                Shipper(Path(tmp), FakeReleases(), "recovery-1")
 
 
 class GitPublicationTests(unittest.TestCase):

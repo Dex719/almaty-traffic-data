@@ -34,7 +34,7 @@
 ## Контракты данных (не ломать)
 
 - **Live-представления в git (`main`)**: `data/scores/YYYY-MM.csv` (каждые 15 мин), `data/events/YYYY-MM.json` (не чаще раза в час), `data/jam_map/ways.json`, `data/jam_map/registries/*.json`.
-- **Архивные потоки в Releases**: `observations/`, `snapshots/`, `jam_map/v2/`. Каждые 15 мин — неизменяемый сегмент `seg-<UTC>-<run_id>-<seq>-<days>.tar.xz` в prerelease `staging`; после закрытия дня (`D+1 00:45 UTC`) — `traffic-YYYY-MM-DD.tar.xz` в релизе `data-YYYY-MM` с `MANIFEST.json`. Загрузки подтверждаются sha256-`digest` из API. Сегменты удаляются после консолидации всех их дней.
+- **Архивные потоки в Releases**: `observations/`, `snapshots/`, `jam_map/v2/`. Каждые 15 мин — неизменяемый сегмент `seg-<UTC>-<run_id>-<seq>-<days>.tar.xz` в prerelease `staging`; после закрытия дня (`D+1 00:45 UTC`) — `traffic-YYYY-MM-DD.tar.xz` в релизе `data-YYYY-MM` с `MANIFEST.json`. Загрузки подтверждаются sha256-`digest` из API. Сегменты удаляются после консолидации всех их дней. В сборку идут только активы `state=uploaded`; незавершённые (`starter`) удаляются по id через час; день, не собранный за 24 ч после закрытия, даёт аннотацию `::error::`.
 - **Журнал**: `observation_id` уникален; повтор ID с другим содержимым отклоняется; имя батча = SHA-256 **распакованного** JSONL; состав батча фиксируется в SQLite до записи файла.
 - **CSV**: пустое поле ≠ ноль; `0.0` сохраняется; счётчики событий только при полном результате обоих слоёв; времена — полный ISO 8601 с микросекундами.
 - **События**: ключ `layer:id`; вне AOI не удаляются, а помечаются `in_aoi=false`; `first_seen` переносится через границу месяца; неполный снимок (`complete=false`) не доказывает исчезновение события.

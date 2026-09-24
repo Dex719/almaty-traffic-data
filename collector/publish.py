@@ -39,10 +39,13 @@ ARCHIVE_PATHS = tuple(f"data/{stream}" for stream in ARCHIVE_STREAMS)
 LIVE_PATHS = ("data/scores", "data/events", "data/jam_map/ways.json", "data/jam_map/registries")
 STAGING_TAG = "staging"
 CLOSE_MARGIN = timedelta(minutes=45)
+ORPHAN_AGE = timedelta(hours=1)      # an unfinished upload younger than this may still be running
+STUCK_AFTER = timedelta(hours=24)    # a closed day unconsolidated this long is escalated
 SEGMENT_BYTES_CAP = 64 * 2**20
 GH_TIMEOUT_SEC = 120
 VERIFY_ATTEMPTS, VERIFY_PAUSE_SEC = 5, 2.0
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+RUN_ID_RE = re.compile(r"[A-Za-z0-9_]+")
 SEGMENT_RE = re.compile(r"^seg-(\d{8}T\d{6}Z)-([A-Za-z0-9_]+)-(\d{4})-((?:\d{4}-\d{2}-\d{2})(?:\+\d{4}-\d{2}-\d{2})*)\.tar\.xz$")
 _SECRET_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|x-access-token:[^@\s]+@)")
 
@@ -114,9 +117,18 @@ def archive_member(rel: str) -> str:
     return rel
 
 
+def closing_time(day: str) -> datetime:
+    return datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1) + CLOSE_MARGIN
+
+
 def day_closed(day: str, now_utc: datetime) -> bool:
-    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return now_utc >= start + timedelta(days=1) + CLOSE_MARGIN
+    return now_utc >= closing_time(day)
+
+
+def annotate(level: str, message: str) -> None:
+    """Surface a persistent failure on the Actions run page; nobody reads shift logs."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::{level}::{message}", flush=True)
 
 
 def month_tag(day: str) -> str:
@@ -174,6 +186,15 @@ class AssetInfo:
     digest: str | None
     state: str
     id: int | None = None
+    created_at: str | None = None
+
+
+def _older_than(asset: AssetInfo, now_utc: datetime, age: timedelta) -> bool:
+    """Unknown creation time counts as young: never delete an upload that may be in flight."""
+    try:
+        return now_utc - datetime.fromisoformat(asset.created_at) >= age
+    except (TypeError, ValueError):
+        return False
 
 
 class ReleaseClient(Protocol):
@@ -181,7 +202,7 @@ class ReleaseClient(Protocol):
     def list_assets(self, tag: str) -> dict[str, AssetInfo]: ...
     def upload(self, tag: str, path: Path) -> None: ...
     def download(self, tag: str, name: str, dest_dir: Path) -> Path: ...
-    def delete_asset(self, tag: str, name: str) -> None: ...
+    def delete_asset(self, tag: str, name: str, asset_id: int | None = None) -> None: ...
 
 
 class GhError(RuntimeError):
@@ -244,7 +265,7 @@ class GhReleases:
                 if digest and digest.startswith("sha256:"):
                     digest = digest[len("sha256:"):]
                 assets[row["name"]] = AssetInfo(row["name"], int(row["size"]), digest,
-                                                row.get("state", "uploaded"), row.get("id"))
+                                                row.get("state", "uploaded"), row.get("id"), row.get("created_at"))
         return assets
 
     def upload(self, tag, path):
@@ -258,8 +279,15 @@ class GhReleases:
             raise GhError(f"downloaded asset missing: {name}")
         return target
 
-    def delete_asset(self, tag, name):
-        self._run("release", "delete-asset", tag, name, "--yes")
+    def delete_asset(self, tag, name, asset_id=None):
+        # `gh release delete-asset` (like `download`) resolves names through the release
+        # object, which omits interrupted "starter" uploads; REST by id deletes any state.
+        if asset_id is None:
+            asset = self.list_assets(tag).get(name)
+            if asset is None or asset.id is None:
+                raise GhError(f"asset {name} not found in {tag}")
+            asset_id = asset.id
+        self._run("api", "-X", "DELETE", f"repos/{{owner}}/{{repo}}/releases/assets/{int(asset_id)}")
 
 
 def upload_verified(releases: ReleaseClient, tag: str, path: Path) -> bool:
@@ -276,7 +304,7 @@ def upload_verified(releases: ReleaseClient, tag: str, path: Path) -> bool:
             logger.info("asset %s already present in %s", name, tag)
             return True
         logger.info("replacing stale asset %s in %s", name, tag)
-        releases.delete_asset(tag, name)
+        releases.delete_asset(tag, name, existing.id)
     releases.upload(tag, path)
     asset = None
     for attempt in range(VERIFY_ATTEMPTS):
@@ -285,7 +313,7 @@ def upload_verified(releases: ReleaseClient, tag: str, path: Path) -> bool:
             if asset.digest == digest and asset.state == "uploaded":
                 return True
             logger.error("asset %s digest mismatch after upload; deleting", name)
-            releases.delete_asset(tag, name)
+            releases.delete_asset(tag, name, asset.id)
             return False
         if attempt < VERIFY_ATTEMPTS - 1:
             time.sleep(VERIFY_PAUSE_SEC)
@@ -295,7 +323,7 @@ def upload_verified(releases: ReleaseClient, tag: str, path: Path) -> bool:
     logger.error("upload of %s could not be verified", name)
     if asset is not None:
         try:
-            releases.delete_asset(tag, name)
+            releases.delete_asset(tag, name, asset.id)
         except Exception:
             logger.warning("could not delete unverified asset %s", name)
     return False
@@ -345,6 +373,8 @@ class Shipper:
 
     def __init__(self, data_dir: Path, releases: ReleaseClient, run_id: str, *,
                  consolidated: set[str] | None = None, lock: threading.Lock | None = None):
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError(f"run_id {run_id!r} must match [A-Za-z0-9_]+: it is part of segment names")
         self.data_dir, self.releases, self.run_id = Path(data_dir), releases, run_id
         self.consolidated = consolidated if consolidated is not None else set()
         self.lock = lock or threading.Lock()
@@ -486,9 +516,13 @@ class Consolidator:
         self.consolidated = consolidated if consolidated is not None else set()
         self.lock = lock or threading.Lock()
         self._month_assets: dict[str, dict[str, AssetInfo]] = {}
+        self._escalated: set[str] = set()
 
     def staging_segments(self) -> list[SegmentInfo]:
-        segments = [parse_segment_name(name) for name in self.releases.list_assets(STAGING_TAG)]
+        """Confirmed segments only: the Shipper re-ships the bytes of an interrupted
+        upload in its next segment, and gh cannot even download one."""
+        assets = self.releases.list_assets(STAGING_TAG)
+        segments = [parse_segment_name(name) for name, asset in assets.items() if asset.state == "uploaded"]
         return sorted((seg for seg in segments if seg is not None), key=lambda seg: seg.name)
 
     def _assets_of_month(self, day: str) -> dict[str, AssetInfo]:
@@ -603,12 +637,23 @@ class Consolidator:
                     day, len(manifest["members"]), manifest["observations"]["count"], manifest["duplicates_dropped"])
         return manifest
 
-    def cleanup_staging(self) -> int:
+    def cleanup_staging(self, now_utc: datetime | None = None) -> int:
+        """Delete segments whose days are all consolidated and interrupted uploads older
+        than ORPHAN_AGE. One failed deletion must not keep the rest of the queue alive."""
+        now_utc = now_utc or datetime.now(timezone.utc)
         deleted = 0
-        for seg in self.staging_segments():
-            if all(self.is_consolidated(day) for day in seg.days):
-                self.releases.delete_asset(STAGING_TAG, seg.name)
+        for name, asset in sorted(self.releases.list_assets(STAGING_TAG).items()):
+            if asset.state == "uploaded":
+                seg = parse_segment_name(name)
+                if seg is None or not all(self.is_consolidated(day) for day in seg.days):
+                    continue
+            elif not _older_than(asset, now_utc, ORPHAN_AGE):
+                continue
+            try:
+                self.releases.delete_asset(STAGING_TAG, name, asset.id)
                 deleted += 1
+            except Exception as exc:
+                logger.error("could not delete staging asset %s: %s", name, scrub(str(exc)))
         return deleted
 
     def run(self, now_utc: datetime | None = None) -> dict:
@@ -624,8 +669,15 @@ class Consolidator:
                 except Exception as exc:
                     logger.error("consolidation of %s failed, will retry: %s", day, scrub(str(exc)))
                     summary["failed"].append(day)
+        for day in summary["failed"]:
+            if now_utc >= closing_time(day) + STUCK_AFTER and day not in self._escalated:
+                self._escalated.add(day)
+                message = (f"day {day} is still not consolidated {STUCK_AFTER.total_seconds()/3600:g} h after "
+                           f"closing; its data waits in the staging release (see 'consolidation of {day} failed')")
+                logger.error(message)
+                annotate("error", message)
         try:
-            summary["deleted_segments"] = self.cleanup_staging()
+            summary["deleted_segments"] = self.cleanup_staging(now_utc)
         except Exception as exc:
             logger.error("staging cleanup failed: %s", scrub(str(exc)))
         return summary
@@ -685,6 +737,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--run-id")
     args = parser.parse_args(argv)
+    if args.run_id is not None and not RUN_ID_RE.fullmatch(args.run_id):
+        parser.error("--run-id may contain only letters, digits and underscores: it is part of segment names")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     publisher = Publisher(args.data_dir, run_id=args.run_id)
     now_utc = datetime.now(timezone.utc)
@@ -696,9 +750,18 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False))
         return 0
     if args.command == "ship":
+        # Cleanup would delete a segment of an already archived day without merging it,
+        # so such bytes are refused loudly instead of being published and lost.
+        publisher.consolidator.candidate_days(now_utc)
+        refused = sorted({day_of(rel) for rel, size in scan_archive_files(publisher.data_dir).items()
+                          if day_of(rel) in publisher.consolidated and size > publisher.shipper.shipped.get(rel, 0)})
+        if refused:
+            logger.error("days %s are already archived in Releases; their files were NOT shipped "
+                         "(late data cannot be merged into a published archive), keep this directory",
+                         ", ".join(refused))
         ok = publisher.ship(now_utc)
-        print(json.dumps({"shipped": ok, "backlog_bytes": publisher.shipper.backlog_bytes()}))
-        return 0 if ok else 1
+        print(json.dumps({"shipped": ok, "backlog_bytes": publisher.shipper.backlog_bytes(), "refused_days": refused}))
+        return 0 if ok and not refused else 1
     summary = publisher.consolidator.run(now_utc)
     print(json.dumps(summary, ensure_ascii=False))
     return 0 if not summary["failed"] else 1

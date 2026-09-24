@@ -32,6 +32,8 @@ fileMatchPattern: 'requirements*.txt|tests/*.py|.github/workflows/*.yml|deploy/*
 
 - `gh release view staging --json assets` — очередь сегментов; `gh release view data-YYYY-MM --json assets` — дневные архивы.
 - Проверка/досборка вручную: `GH_REPO=Dex719/almaty-traffic-data python -m collector.publish status|consolidate --data-dir data`.
+- Незавершённые загрузки (`state=starter`) видны только в `gh api repos/{owner}/{repo}/releases/<id>/assets`, но не в `gh release view/download/delete-asset`. Удалять их только по id: `gh api -X DELETE repos/{owner}/{repo}/releases/assets/<id>` (сборщик делает это сам через час, спека `release-asset-state-bugfix`).
+- `--run-id` только `[A-Za-z0-9_]+` (часть имени сегмента); `ship` отказывает дням, уже собранным в `data-YYYY-MM` (код 1, `refused_days`).
 
 ## Сервер
 

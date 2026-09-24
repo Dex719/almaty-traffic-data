@@ -57,7 +57,7 @@
 - IF релиз `staging` отсутствует, THEN the system SHALL создать его как prerelease.
 - WHEN объём неотгруженных данных превышает 64 МиБ, the system SHALL отгрузить старейшие файлы в пределах лимита, остальное — в следующих циклах.
 - WHEN день файла уже консолидирован, the system SHALL NOT отгружать его.
-- IF актив с именем сегмента уже существует в незавершённом состоянии (`state ≠ uploaded`) или с другим размером, THEN the system SHALL удалить его перед загрузкой.
+- IF актив с именем сегмента уже существует в незавершённом состоянии (`state ≠ uploaded`) или с другим размером, THEN the system SHALL удалить его перед загрузкой по id через REST, потому что `gh` незавершённые активы не видит ([release-asset-state-bugfix](../release-asset-state-bugfix/bugfix.md) BUG-2).
 - **AC-2.1** Given два новых батча и 300 дописанных байт в `jam_map/v2/D.csv`, When `ship`, Then один актив; manifest содержит 3 записи с `offset/length/sha256`; состояние продвинуто.
 - **AC-2.2** Given API возвращает неверный digest, When `ship`, Then результат `False`, состояние не изменилось, следующий `ship` включает те же байты.
 - **AC-2.3** Given нечего отгружать, When `ship`, Then загрузок нет, результат `True`.
@@ -70,6 +70,8 @@
 - WHEN у текущего run есть локальные файлы дня D, the system SHALL использовать их вместо его же сегментов из `staging`.
 - IF обнаружен разрыв смещений внутри run, THEN the system SHALL собрать архив из имеющихся данных и перечислить разрывы в `MANIFEST.json`.
 - WHEN день консолидирован, the system SHALL удалить из `staging` сегменты, все дни которых консолидированы.
+- WHEN собирается день, the system SHALL учитывать только активы `staging` в состоянии `uploaded`. Незавершённые активы старше 1 часа удаляются по id. Сбой удаления одного актива SHALL NOT прерывать очистку остальных (release-asset-state-bugfix BUG-1).
+- IF закрытый день не консолидирован через 24 часа после закрытия, THEN the system SHALL один раз за процесс записать ERROR и под GitHub Actions вывести аннотацию `::error::` (BUG-4).
 - IF консолидация завершилась ошибкой, THEN the system SHALL продолжить сбор, залогировать ошибку без секретов и повторить попытку в следующем цикле или вахте.
 - IF месячный релиз отсутствует, THEN the system SHALL создать его с тегом `data-YYYY-MM` и описанием формата.
 - WHEN консолидация выполняется, the system SHALL NOT блокировать цикл опроса источников и watchdog.
@@ -98,6 +100,8 @@
 
 ### FR-7 CLI оператора (Should)
 - WHEN оператор запускает `python -m collector.publish {status|ship|consolidate} --data-dir <dir>`, the system SHALL выполнить действие с `GH_TOKEN`/`GH_REPO` из окружения и вернуть ненулевой код при ошибке.
+- WHEN `ship` находит файлы дня, уже консолидированного в релизе, the system SHALL NOT отгружать их, SHALL перечислить их в `refused_days` и вернуть код 1 (release-asset-state-bugfix BUG-3).
+- IF `--run-id` не соответствует `[A-Za-z0-9_]+`, THEN the system SHALL отклонить запуск (BUG-5).
 
 ### FR-8 Серверный режим без изменений (Must)
 - WHEN сборщик запущен без `--git`, the system SHALL NOT обращаться к GitHub и SHALL NOT требовать `gh`.
@@ -120,7 +124,7 @@
 - Повторная отгрузка одних байт под разными run (например, вахта умерла до `git rm --cached`): построчная дедупликация при сборке.
 - `gh` отсутствует или `GH_TOKEN` пуст: отгрузка не удаётся → семантика как при неудачном push (стагнация 45 мин → код 1, recovery artifact).
 - 429/5xx GitHub: попытка не засчитывается, повтор в следующем цикле.
-- Актив в состоянии `starter` после оборванной загрузки: удаляется перед повторной загрузкой.
+- Актив в состоянии `starter` после оборванной загрузки удаляется по id перед повторной загрузкой под тем же именем. Сегмент повторяется под новым именем, поэтому его `starter` игнорируется при сборке и удаляется через час (release-asset-state-bugfix).
 
 ## Ограничения
 
@@ -140,12 +144,12 @@
 | ID | Приоритет | Статус |
 |---|---|---|
 | FR-1 | Must | Implemented (tests) |
-| FR-2 | Must | Implemented (tests) |
-| FR-3 | Must | Implemented (tests) |
+| FR-2 | Must | Implemented (tests); незавершённые активы уточнены в release-asset-state-bugfix |
+| FR-3 | Must | Implemented (tests); фильтр `uploaded`, очистка сирот и эскалация — release-asset-state-bugfix |
 | FR-4 | Must | Implemented; `.gitignore` добавлен оператором раньше плана, cutover выполнен вручную без потерь (см. tasks.md Deviation) |
 | FR-5 | Should | Implemented (tests) |
 | FR-6 | Must | Implemented (tests) |
-| FR-7 | Should | Implemented (tests) |
+| FR-7 | Should | Implemented (tests); отказ для собранных дней и проверка `--run-id` — release-asset-state-bugfix |
 | FR-8 | Must | Implemented (tests) |
 | NFR-1 | — | Verify after cutover (ожидание ≈1 МБ/сутки) |
 | NFR-2..6 | — | Implemented (tests, offline CI) |
