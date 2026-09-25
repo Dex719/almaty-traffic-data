@@ -24,7 +24,7 @@ from pathlib import Path
 from collector import sources, store
 from collector.journal import Journal
 from collector.ops import exclusive_collector, health_report, notify_systemd, ping_heartbeat
-from collector.publish import ARCHIVE_PATHS, LIVE_PATHS
+from collector.publish import ARCHIVE_PATHS, LIVE_PATHS, scrub
 
 logger = logging.getLogger("collector.shift")
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -32,7 +32,7 @@ DATA_DIR = REPO_DIR/"data"
 DGIS_EVERY_MIN, YANDEX_EVERY_MIN, EVENTS_EVERY_MIN = 1, 4, 5
 JAMMAP_EVERY_MIN, COMMIT_EVERY_MIN, EVENTS_COMMIT_EVERY_MIN = 5, 15, 60
 FAILS_TO_COOLDOWN, COOLDOWN_MIN = 3, 10
-GIT_TIMEOUT_SEC, PUSH_STALL_MIN = 20, 45
+GIT_TIMEOUT_SEC, GIT_NETWORK_TIMEOUT_SEC, PUSH_STALL_MIN = 20, 60, 45
 INTERVALS = {"dgis": 60, "yandex": 240, "events_user": 300, "events_2gis": 300, "jammap": 300}
 
 
@@ -92,7 +92,13 @@ def commit_and_push(*, include_events: bool = True, drop_archive: bool = False) 
         remaining = deadline-time.monotonic()
         if remaining <= 0:
             return subprocess.CompletedProcess(["git", *args], 124, "", "budget exceeded")
-        return _git(*args, timeout=min(GIT_TIMEOUT_SEC, remaining))
+        # The first pull/push of a fresh shallow runner clone regularly outlasts 20 s.
+        network = args[0] in ("pull", "push")
+        proc = _git(*args, timeout=min(GIT_NETWORK_TIMEOUT_SEC if network else GIT_TIMEOUT_SEC, remaining))
+        if network and proc.returncode:
+            logger.warning("git %s failed (%s): %s", args[0], proc.returncode,
+                           scrub((proc.stderr or "").strip())[-300:])
+        return proc
 
     live = [path for path in LIVE_PATHS
             if (include_events or path != "data/events") and (REPO_DIR/path).exists()]
