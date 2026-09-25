@@ -274,6 +274,32 @@ class HardeningTests(unittest.TestCase):
             self.assertTrue(shift.commit_and_push())
         self.assertEqual(git(work,"rev-parse","HEAD"),git(base,"--git-dir="+str(remote),"rev-parse","main"))
 
+    def test_network_git_gets_longer_timeout_than_local_git(self):
+        (self.data/"scores").mkdir()
+        timeouts={}
+        def fake_git(*args,timeout=None):
+            timeouts[args[0]]=timeout
+            return subprocess.CompletedProcess(args,1 if args[:2]==("diff","--cached") else 0,"0\n","")
+        with patch.object(shift,"_git",side_effect=fake_git),patch.object(shift,"REPO_DIR",self.data.parent):
+            self.assertTrue(shift.commit_and_push())
+        self.assertGreater(timeouts["pull"],shift.GIT_TIMEOUT_SEC)   # a fresh shallow runner clone needs >20 s at first
+        self.assertGreater(timeouts["push"],shift.GIT_TIMEOUT_SEC)
+        self.assertEqual(timeouts["commit"],shift.GIT_TIMEOUT_SEC)
+
+    def test_failed_network_git_is_logged_with_reason_and_scrubbed(self):
+        (self.data/"scores").mkdir()
+        def fake_git(*args,timeout=None):
+            if args[0]=="push":
+                return subprocess.CompletedProcess(args,128,"","fatal: unable to access 'https://x-access-token:ghs_secret0123456789@github.com/r.git/'")
+            return subprocess.CompletedProcess(args,1 if args[:2]==("diff","--cached") else 0,"","")
+        with patch.object(shift,"_git",side_effect=fake_git),patch.object(shift,"REPO_DIR",self.data.parent), \
+             patch.object(shift.time,"sleep"),self.assertLogs("collector.shift","WARNING") as logs:
+            self.assertFalse(shift.commit_and_push())
+        text="\n".join(logs.output)
+        self.assertIn("git push failed (128)",text)
+        self.assertIn("unable to access",text)
+        self.assertNotIn("ghs_secret",text)
+
     def test_missing_tile_is_retried_once(self):
         buf = io.BytesIO()
         Image.new("RGBA", (256,256), (80,200,90,255)).save(buf, format="PNG")

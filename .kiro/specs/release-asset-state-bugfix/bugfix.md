@@ -1,6 +1,6 @@
 # Bugfix Spec: release-asset-state-bugfix
 
-**Spec Type:** Bugfix Spec (bugfix + tasks одним проходом: причины найдены и воспроизведены, запуск оператором «чини и фикси баги») · **Created:** 2026-09-23 · **Status:** BUG-1..5 fixed (70 passed); восстановление 2026-09-17/18 выполнено 2026-09-24; проверка на проде после merge (TSK-B09)
+**Spec Type:** Bugfix Spec (bugfix + tasks одним проходом: причины найдены и воспроизведены, запуск оператором «чини и фикси баги») · **Created:** 2026-09-23 · **Status:** Done: BUG-1..5 fixed (PR #11), восстановление 2026-09-17/18 выполнено 2026-09-24, проверено на проде 2026-09-25 (TSK-B09)
 **Источник:** ревью Actions и Releases 2026-09-23: консолидация 2026-09-17 и 2026-09-18 падает каждые 15 минут начиная с 2026-09-18 00:45 UTC.
 **Связь:** уточняет FR-2, FR-3, FR-7 и edge case «starter» спеки [release-archive-publishing](../release-archive-publishing/requirements.md).
 
