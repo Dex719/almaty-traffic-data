@@ -106,7 +106,10 @@ def fetch_tiles(client=None, *, grid=None, workers=4, budget=120.0,
             x, y = xy
             response = client.get(TILE_URL.format(x=x, y=y, z=Z, tm=tm),
                                   timeout=max(0.1, min(15.0, deadline-time.monotonic())))
-            if response.status_code in (429, 503):
+            if response.status_code in (401, 403, 429, 503):
+                # A block or a rate limit must reach SourceGuard with its status code:
+                # 401/403 pause the map for an hour, 429/503 honour Retry-After. Returning
+                # None here would mean a second request per tile and a 10-minute cooldown.
                 response.raise_for_status()
             if response.status_code != 200 or len(response.content) > 2_000_000:
                 return xy, None
@@ -136,8 +139,9 @@ def fetch_tiles(client=None, *, grid=None, workers=4, budget=120.0,
     try:
         collect([pool.submit(fetch, xy) for xy in grid], budget)
         missing = [xy for xy in grid if xy not in tiles]
-        if missing and not stop.is_set() and time.monotonic() < deadline:
+        if missing and tiles and not stop.is_set() and time.monotonic() < deadline:
             # One retry pass: a handful of transient misses must not mark the frame partial.
+            # Nothing at all (HTML instead of PNG, captcha) is not a handful: no second pass.
             logger.info("retrying %d missing tiles", len(missing))
             collect([pool.submit(fetch, xy) for xy in missing], deadline-time.monotonic())
     except TimeoutError:

@@ -428,3 +428,32 @@ class SilentFailureTests(unittest.TestCase):
         leaked = shift.describe_error(ValueError("token ghp_abcdefghijklmnop123 leaked"))
         self.assertIn("ValueError", leaked)
         self.assertNotIn("ghp_abcdef", leaked)
+
+
+class ChainAndTilesTests(unittest.TestCase):
+    """collector-chain-and-tiles-bugfix: a blocked tile endpoint must reach the guard with its status."""
+
+    def test_blocked_tiles_stop_acquisition_and_reach_the_guard(self):
+        calls = []
+        class Client:
+            def get(self, url, **kwargs):
+                calls.append(url)
+                return httpx.Response(403, request=httpx.Request("GET", url))
+        with self.assertRaises(httpx.HTTPStatusError) as ctx:
+            jammap.fetch_tiles(Client(), grid=[(0, 0), (1, 0), (2, 0)], min_interval=0, workers=1)
+        self.assertEqual(ctx.exception.response.status_code, 403)
+        self.assertLessEqual(len(calls), 3)  # no second pass over a blocked endpoint
+        guard = shift.SourceGuard("jammap")
+        guard.fail(100, ctx.exception)
+        self.assertFalse(guard.ready(100+3599))
+        self.assertTrue(guard.ready(100+3600))
+
+    def test_no_retry_pass_when_nothing_arrived(self):
+        calls = []
+        class Client:
+            def get(self, url, **kwargs):
+                calls.append(url)
+                return SimpleNamespace(status_code=200, content=b"<html>captcha</html>")
+        tiles = jammap.fetch_tiles(Client(), grid=[(0, 0), (1, 0)], min_interval=0, workers=1)
+        self.assertEqual(tiles, {})
+        self.assertEqual(len(calls), 2)

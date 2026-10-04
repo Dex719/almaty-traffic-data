@@ -1,6 +1,6 @@
 # Bugfix Spec: collector-silent-failures-bugfix
 
-**Spec Type:** Bugfix Spec (bugfix + tasks одним проходом) · **Created:** 2026-10-04 · **Status:** Fixed in branch `fix/collector-silent-failures-bugfix` (81 passed), ждёт PR; TSK-S06 (secret + проверка на проде) после merge
+**Spec Type:** Bugfix Spec (bugfix + tasks одним проходом) · **Created:** 2026-10-04 · **Status:** Merged (PR #13, 2026-10-04 17:32 UTC); TSK-S06 (secret + проверка на проде) открыт
 **Источник:** аудит 2026-10-04 (локальный отчёт, пункты 1, 2 и 5 топ-5): чтение кода и живых данных, 5 офлайн-аудиторов, перекрёстная проверка. Прод на момент аудита здоров (0 failure за 100 run, все источники ok), баги латентные.
 **Связь:** уточняет стандарты «Обработка ошибок» и «Логи» (`.kiro/steering/project-standards.md`), контракт `run_id` спеки [release-archive-publishing](../release-archive-publishing/requirements.md).
 
