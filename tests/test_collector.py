@@ -251,12 +251,13 @@ def test_jammap_harvest_writes_csv(tmp_path, monkeypatch):
             return (80, 200, 90, 255)
 
     monkeypatch.setattr(jammap, "fetch_tiles",
-                        lambda client=None, **kwargs: {xy: FakeTile() for xy in jammap.tile_grid()})
+                        lambda client=None, **kwargs: {xy: FakeTile() for xy in kwargs["grid"]})
     from datetime import datetime, timezone
 
     stats = jammap.harvest(tmp_path, datetime(2026, 9, 2, 3, 30, tzinfo=timezone.utc))
-    assert stats["covered"] == 2
-    day = tmp_path / "jam_map" / "2026-09-02.csv"
-    rows = day.read_text().strip().splitlines()
-    assert rows[0] == "ts_utc,ts_almaty,covered,classes"
-    assert rows[1].endswith(",2,GG")
+    assert stats["covered"] == 2 and stats["quality"] == "ok"
+    assert not (tmp_path / "jam_map" / "2026-09-02.csv").exists(), "legacy schema is frozen"
+    day = tmp_path / "jam_map" / "v2" / "2026-09-02.csv"
+    rows = list(csv.DictReader(day.open(encoding="utf-8")))
+    assert list(rows[0]) == jammap.V2_FIELDS
+    assert (rows[0]["covered"], rows[0]["classes"], rows[0]["quality"]) == ("2", "GG", "ok")

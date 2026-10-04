@@ -132,7 +132,7 @@ def fetch_tiles(client=None, *, grid=None, workers=4, budget=120.0,
                 rate_error.append(exc)
             stop.set()
             return xy, None
-        except (httpx.HTTPError, UnidentifiedImageError, OSError, ValueError) as exc:
+        except (httpx.HTTPError, UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
             return miss(xy, type(exc).__name__)
 
     tiles = {}
@@ -277,18 +277,16 @@ def capture(data_dir: Path, now_utc: datetime) -> dict:
             "matched_fraction": fractions}
 
 
-def append_frame(data_dir: Path, frame: dict, *, legacy=False) -> Path:
+def append_frame(data_dir: Path, frame: dict) -> Path:
+    """Append one frame to ``jam_map/v2/<Almaty day>.csv``; the legacy schema is frozen."""
     day = frame["ts_almaty"][:10]
-    folder = data_dir/"jam_map" if legacy else data_dir/"jam_map/v2"
-    path = folder/f"{day}.csv"
+    path = data_dir/"jam_map/v2"/f"{day}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = FIELDS if legacy else V2_FIELDS
-    row = {key: frame[key] for key in fields}
-    if not legacy:
-        row["matched_fraction"] = json.dumps(row["matched_fraction"], separators=(",", ":"))
+    row = {key: frame[key] for key in V2_FIELDS}
+    row["matched_fraction"] = json.dumps(row["matched_fraction"], separators=(",", ":"))
     fresh = not path.exists() or path.stat().st_size == 0
     with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=V2_FIELDS)
         if fresh:
             writer.writeheader()
         writer.writerow(row)
@@ -298,9 +296,11 @@ def append_frame(data_dir: Path, frame: dict, *, legacy=False) -> Path:
 
 
 def harvest(data_dir: Path, now_utc: datetime) -> dict:
+    """One manual frame (``python -m collector.jammap``) into the same v2 file the shift writes."""
     frame = capture(data_dir, now_utc)
-    append_frame(data_dir, frame, legacy=True)
-    return {"tiles": frame["tiles_received"], "ways": len(frame["classes"]), "covered": frame["covered"]}
+    append_frame(data_dir, frame)
+    return {"tiles": frame["tiles_received"], "ways": len(frame["classes"]),
+            "covered": frame["covered"], "quality": frame["quality"]}
 
 
 if __name__ == "__main__":

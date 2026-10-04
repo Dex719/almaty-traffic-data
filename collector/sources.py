@@ -194,9 +194,10 @@ def fetch_dgis_layer(layer: str) -> list[dict[str, Any]]:
     return EventList(events.values(), invalid_rows)
 
 
-def fetch_dgis_events() -> list[dict[str, Any]]:
-    """Compatibility API. Strict completeness; the scheduler uses separate layers."""
-    return fetch_dgis_layer("user") + fetch_dgis_layer("2gis")
+def fetch_dgis_events() -> EventList:
+    """Compatibility API: both layers in one list, parser losses summed (the scheduler polls layers separately)."""
+    user, official = fetch_dgis_layer("user"), fetch_dgis_layer("2gis")
+    return EventList(list(user)+list(official), user.invalid_rows+official.invalid_rows)
 
 
 def get_client():
