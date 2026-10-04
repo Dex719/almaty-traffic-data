@@ -531,3 +531,160 @@ class SecondTierTests(unittest.TestCase):
         self.assertIn("journal-20260102T000000Z-old.sqlite3.gz", names)
         self.assertEqual(len([n for n in names if n.endswith(".gz")]), 2)
         self.assertEqual(journal.prune_backups(dest, 0), [])
+
+
+class LeftoverTests(unittest.TestCase):
+    """collector-audit-leftovers: the small things from the 2026-10-04 audit."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.data = Path(self.temp.name)/"data"
+        self.data.mkdir()
+        self.now = int(time.time())
+        self.healthy = [patch.object(sources, "fetch_yandex_score", return_value={"score": 2, "ts": self.now}),
+                        patch.object(sources, "fetch_dgis_score", return_value={"score": 1, "ts": self.now}),
+                        patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([EVENT]))]
+
+    def test_retry_after_is_capped_at_an_hour(self):
+        error = RuntimeError("rate limited")
+        error.response = SimpleNamespace(headers={"Retry-After": "2592000"}, status_code=429)
+        guard = shift.SourceGuard("source")
+        guard.fail(100, error)
+        self.assertFalse(guard.ready(100+3599))
+        self.assertTrue(guard.ready(100+3600))
+
+    def test_stale_data_does_not_count_as_a_success_for_health(self):
+        with self.healthy[0], patch.object(sources, "fetch_dgis_score", return_value={"score": 1, "ts": self.now-3600}), \
+             self.healthy[2]:
+            shift.run_shift(1, self.data, once=True)
+        report = json.loads((self.data/".state/health.json").read_text())
+        self.assertIsNone(report["sources"]["dgis"].get("last_success"))
+        self.assertFalse(report["sources"]["dgis"]["healthy"])
+        self.assertIsNotNone(report["sources"]["yandex"]["last_success"])
+
+    def test_corrupt_batch_file_is_rewritten_not_fatal(self):
+        log = journal.Journal(self.data)
+        self.addCleanup(log.close)
+        log.record("dgis", NOW, {"score": 1})
+        log.export_pending()
+        path = next((self.data/"observations").rglob("*.gz"))
+        body = gzip.decompress(path.read_bytes())
+        good = path.read_bytes()
+        path.write_bytes(good[:10] + b"\x07" + good[11:])          # valid gzip header, broken deflate stream
+        log.db.execute("UPDATE export_batches SET sent=0, body=?", (body.decode(),))
+        log.db.commit()
+        log.export_pending()
+        self.assertEqual(hashlib.sha256(gzip.decompress(path.read_bytes())).hexdigest(), path.name[:-len(".jsonl.gz")])
+
+    def test_startup_sweep_removes_leftovers_of_an_unclean_stop(self):
+        (self.data/"events").mkdir()
+        (self.data/"events/.tmp-abc123").write_text("half-written registry")
+        (self.data/".state/.tmp-consolidate-x").mkdir(parents=True)
+        (self.data/".state/.tmp-consolidate-x/segment.tar.xz").write_bytes(b"x")
+        (self.data/".state/segments").mkdir()
+        (self.data/".state/segments/seg-old.tar.xz").write_bytes(b"x")
+        with self.healthy[0], self.healthy[1], self.healthy[2], \
+             self.assertLogs("collector.shift", level="INFO") as logs:
+            shift.run_shift(1, self.data, once=True)
+        self.assertFalse((self.data/"events/.tmp-abc123").exists())
+        self.assertFalse((self.data/".state/.tmp-consolidate-x").exists())
+        self.assertFalse((self.data/".state/segments/seg-old.tar.xz").exists())
+        self.assertTrue(any("removed 3 temporary files" in line for line in logs.output))
+        self.assertEqual(store.sweep_temporary(self.data), 0)
+
+    def test_empty_score_file_gets_a_header(self):
+        path = self.data/"scores"/"2026-09.csv"
+        path.parent.mkdir()
+        path.touch()
+        store.append_score_row(self.data, NOW, {"score": 1}, None, None, monthly=True)
+        self.assertEqual(path.read_text(encoding="utf-8").splitlines()[0], ",".join(store.SCORE_FIELDS))
+
+    def test_decompression_bomb_is_isolated_like_a_corrupt_tile(self):
+        buf = io.BytesIO()
+        Image.new("RGBA", (256, 256), (80, 200, 90, 255)).save(buf, format="PNG")
+        original = Image.open
+        def guarded_open(fp, *args, **kwargs):
+            if b"BOMB" in fp.getvalue():
+                raise Image.DecompressionBombError("Image size exceeds limit")
+            return original(fp, *args, **kwargs)
+        class Client:
+            def get(self, url, **kwargs):
+                content = b"\x89PNG\r\n\x1a\nBOMB" if "x=0&" in url else buf.getvalue()
+                return SimpleNamespace(status_code=200, content=content)
+        with patch.object(Image, "open", side_effect=guarded_open):
+            tiles = jammap.fetch_tiles(Client(), grid=[(0, 0), (1, 0)], min_interval=0, workers=1)
+        self.assertEqual(set(tiles), {(1, 0)})
+
+    def test_ok_map_with_low_coverage_is_not_healthy(self):
+        state = {"jammap": {"interval": 300, "status": "ok", "coverage_ratio": 0.6,
+                            "last_success": store.utc_stamp(NOW)}}
+        self.assertFalse(ops.health_report(state, NOW)["healthy"])
+        state["jammap"]["coverage_ratio"] = 0.99
+        self.assertTrue(ops.health_report(state, NOW)["healthy"])
+
+    def test_heartbeat_rejects_insecure_urls_and_pings_https(self):
+        import httpx as real_httpx
+        calls = []
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return SimpleNamespace(status_code=200)
+        with patch.object(real_httpx, "get", side_effect=fake_get):
+            with patch.dict(os.environ, {"TRAFFIC_HEARTBEAT_URL": "http://hc.example/uuid"}):
+                self.assertFalse(ops.ping_heartbeat())
+            with patch.dict(os.environ, {"TRAFFIC_HEARTBEAT_URL": "https://user:pw@hc.example/uuid"}):
+                self.assertFalse(ops.ping_heartbeat())
+            with patch.dict(os.environ, {"TRAFFIC_HEARTBEAT_URL": ""}):
+                self.assertFalse(ops.ping_heartbeat())
+            self.assertEqual(calls, [])
+            with patch.dict(os.environ, {"TRAFFIC_HEARTBEAT_URL": "https://hc.example/uuid"}):
+                self.assertTrue(ops.ping_heartbeat())
+        self.assertEqual(calls, ["https://hc.example/uuid"])
+
+    def test_publication_stall_ends_the_shift_loudly(self):
+        class FakePublisher:
+            def __init__(self, *args, **kwargs): pass
+            def ship(self, now_utc=None): return True
+            def fully_shipped(self): return False
+            def maybe_consolidate(self, now_utc=None): pass
+            def close(self): pass
+        from collector import publish
+        with self.healthy[0], self.healthy[1], self.healthy[2], \
+             patch.object(publish, "Publisher", FakePublisher), \
+             patch.object(shift, "commit_and_push", lambda **kwargs: False), \
+             patch.object(shift, "COMMIT_EVERY_MIN", 0), patch.object(shift, "PUSH_STALL_MIN", 0), \
+             self.assertLogs("collector.shift", level="ERROR") as logs:
+            code = shift.run_shift(1, self.data, once=True, git_enabled=True)
+        self.assertEqual(code, 1)
+        self.assertTrue(any("No successful publication" in line for line in logs.output))
+
+    def test_stop_event_triggers_the_final_export(self):
+        import threading
+        stop = threading.Event()
+        def dgis():
+            stop.set()                       # SIGTERM arrives while a poll is in flight
+            return {"score": 1, "ts": self.now}
+        with self.healthy[0], patch.object(sources, "fetch_dgis_score", side_effect=dgis), self.healthy[2]:
+            code = shift.run_shift(5, self.data, stop_event=stop)
+        self.assertEqual(code, 0)
+        self.assertTrue(list((self.data/"observations").rglob("*.gz")), "final export ran on stop")
+        self.assertTrue((self.data/".state/health.json").exists())
+
+    def test_ops_check_cli_reports_fresh_health_only(self):
+        import sys
+        (self.data/".state").mkdir()
+        argv = ["ops", "check", "--data-dir", str(self.data)]
+        for checked_at, expected in ((datetime.now(timezone.utc), 0), (datetime.now(timezone.utc)-timedelta(hours=1), 1)):
+            store.atomic_json(self.data/".state/health.json", {"healthy": True, "checked_at": store.utc_stamp(checked_at)})
+            with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
+                self.assertEqual(ops.main(), expected)
+        store.atomic_json(self.data/".state/health.json", {"healthy": False, "checked_at": store.utc_stamp(datetime.now(timezone.utc))})
+        with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
+            self.assertEqual(ops.main(), 1)
+
+    def test_fetch_dgis_events_keeps_parser_losses(self):
+        raw = {"id": "a", "type": "crash", "location": {"type": "Point", "coordinates": [76.9, 43.25]}}
+        with patch.object(sources, "_get", return_value=SimpleNamespace(json=lambda **kwargs: [raw, "garbage"])):
+            events = sources.fetch_dgis_events()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events.invalid_rows, 2)

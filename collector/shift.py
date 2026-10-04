@@ -29,9 +29,9 @@ from collector.publish import ARCHIVE_PATHS, LIVE_PATHS, annotate, scrub
 logger = logging.getLogger("collector.shift")
 REPO_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_DIR/"data"
-DGIS_EVERY_MIN, YANDEX_EVERY_MIN, EVENTS_EVERY_MIN = 1, 4, 5
-JAMMAP_EVERY_MIN, COMMIT_EVERY_MIN = 5, 15
+COMMIT_EVERY_MIN = 15
 FAILS_TO_COOLDOWN, COOLDOWN_MIN = 3, 10
+RETRY_AFTER_CAP_SEC = 3600   # a provider's Retry-After of a month must not park a source for a month
 GIT_TIMEOUT_SEC, GIT_NETWORK_TIMEOUT_SEC, PUSH_STALL_MIN = 20, 60, 45
 INTERVALS = {"dgis": 60, "yandex": 240, "events_user": 300, "events_2gis": 300, "jammap": 300}
 
@@ -62,8 +62,7 @@ class SourceGuard:
                         pass
             if response.status_code in (401, 403):
                 wait = max(wait, 3600)
-        if not math.isfinite(wait):
-            wait = 0
+        wait = 0 if not math.isfinite(wait) else min(wait, RETRY_AFTER_CAP_SEC)
         if self.fails >= FAILS_TO_COOLDOWN:
             wait = max(wait, COOLDOWN_MIN*60)
             self.fails = 0
@@ -163,6 +162,9 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
               git_enabled=False, stop_event=None, once=False) -> int:
     from collector import jammap
     stop = stop_event or threading.Event()
+    swept = store.sweep_temporary(data_dir)   # the caller holds the process lock: leftovers are ours
+    if swept:
+        logger.info("removed %d temporary files left by an unclean stop", swept)
     journal = Journal(data_dir)
     publisher = None
     if git_enabled:
@@ -224,8 +226,9 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
         else:
             guards[name].ok()
             states[name].pop("error_code", None)
-            states[name]["last_success"] = store.utc_stamp(observed)
             if status in ("ok", "partial"):
+                # stale or timestamp-less data is not a success: health ages from here
+                states[name]["last_success"] = store.utc_stamp(observed)
                 successes += 1
                 ok_counts[name] += 1
         if status != previous:
@@ -321,6 +324,8 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
             if now >= next_export:
                 journal.export_pending()
                 if git_enabled and not publish() and time.monotonic()-last_push_ok >= PUSH_STALL_MIN*60:
+                    logger.error("No successful publication for %d min; ending the shift so a successor "
+                                 "with a fresh runner can take over", PUSH_STALL_MIN)
                     fatal = True
                     break
                 next_export = advance_due(next_export, now, COMMIT_EVERY_MIN*60)

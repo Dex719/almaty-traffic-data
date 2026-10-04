@@ -44,6 +44,7 @@ STUCK_AFTER = timedelta(hours=24)    # a closed day unconsolidated this long is 
 SEGMENT_BYTES_CAP = 64 * 2**20
 GH_TIMEOUT_SEC = 120
 VERIFY_ATTEMPTS, VERIFY_PAUSE_SEC = 5, 2.0
+RETRY_BASE, RETRY_CAP = timedelta(minutes=15), timedelta(hours=6)   # per-day consolidation backoff
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_]+")
 SEGMENT_RE = re.compile(r"^seg-(\d{8}T\d{6}Z)-([A-Za-z0-9_]+)-(\d{4})-((?:\d{4}-\d{2}-\d{2})(?:\+\d{4}-\d{2}-\d{2})*)\.tar\.xz$")
@@ -102,18 +103,29 @@ def default_run_id() -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", raw)
 
 
+def valid_day(day: str) -> bool:
+    """A real calendar date: a stray ``2026-02-30`` file must not crash every publication pass."""
+    if not DAY_RE.match(day):
+        return False
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
 def day_of(rel: str) -> str | None:
     """Calendar day encoded in an archive-stream path relative to ``data/``."""
     parts = rel.split("/")
-    if parts[0] == "observations" and len(parts) == 3 and DAY_RE.match(parts[1]) \
+    if parts[0] == "observations" and len(parts) == 3 and valid_day(parts[1]) \
             and parts[2].endswith(".jsonl.gz") and not parts[2].startswith("."):
         return parts[1]
     if parts[0] == "snapshots" and len(parts) == 3 and parts[2].endswith(".jsonl"):
         day = f"{parts[1]}-{parts[2][:-6]}"
-        return day if DAY_RE.match(day) else None
+        return day if valid_day(day) else None
     if parts[0] == "jam_map" and len(parts) == 3 and parts[1] == "v2" and parts[2].endswith(".csv"):
         day = parts[2][:-4]
-        return day if DAY_RE.match(day) else None
+        return day if valid_day(day) else None
     return None
 
 
@@ -171,6 +183,8 @@ def parse_segment_name(name: str) -> SegmentInfo | None:
     if not match:
         return None
     stamp, run_id, seq, days = match.groups()
+    if not all(valid_day(day) for day in days.split("+")):
+        return None
     return SegmentInfo(name, stamp, run_id, int(seq), tuple(days.split("+")))
 
 
@@ -252,7 +266,9 @@ class GhReleases:
         try:
             return json.loads(self._run("api", f"repos/{{owner}}/{{repo}}/releases/tags/{tag}"))
         except GhError as exc:
-            if "404" in str(exc) or "Not Found" in str(exc):
+            # Only the status code decides: a rate-limit message naming an id with "404" in it,
+            # or any text with "Not Found", must not read as "release does not exist".
+            if re.search(r"\(HTTP 404\)", str(exc)):
                 return None
             raise
 
@@ -385,15 +401,18 @@ class Shipper:
     """Ships unshipped bytes of the archive streams as immutable segments."""
 
     def __init__(self, data_dir: Path, releases: ReleaseClient, run_id: str, *,
-                 consolidated: set[str] | None = None, lock: threading.Lock | None = None):
+                 consolidated: set[str] | None = None, lock: threading.Lock | None = None,
+                 archived: dict[str, int] | None = None):
         if not RUN_ID_RE.fullmatch(run_id):
             raise ValueError(f"run_id {run_id!r} must match [A-Za-z0-9_]+: it is part of segment names")
         self.data_dir, self.releases, self.run_id = Path(data_dir), releases, run_id
         self.consolidated = consolidated if consolidated is not None else set()
+        self.archived = archived if archived is not None else {}   # local bytes the day archive took
         self.lock = lock or threading.Lock()
         self.state_path = self.data_dir / ".state" / "publish.json"
         self.shipped: dict[str, int] = {}
         self.seq = 0
+        self._late_warned: set[str] = set()
         self._load_state()
 
     def _load_state(self) -> None:
@@ -414,10 +433,18 @@ class Shipper:
         now_utc = now_utc or datetime.now(timezone.utc)
         with self.lock:
             done = set(self.consolidated)
+            archived = dict(self.archived)
         ranges = []
         for rel, size in scan_archive_files(self.data_dir).items():
             day = day_of(rel)
             if day in done:
+                covered = max(self.shipped.get(rel, 0), archived.get(rel, 0))
+                if size > covered and rel not in self._late_warned:
+                    # The daily archive is immutable: bytes that arrived after it was built stay
+                    # local only. Say so once per file instead of dropping them in silence.
+                    self._late_warned.add(rel)
+                    logger.warning("%s: %d bytes newer than the published archive of %s stay local only",
+                                   rel, size-covered, day)
                 continue
             offset = self.shipped.get(rel, 0)
             if size > offset:
@@ -457,7 +484,12 @@ class Shipper:
         for item in chosen:
             self.shipped[item.path] = item.offset + item.length
         self.seq += 1
-        self._save_state()
+        try:
+            self._save_state()
+        except OSError as exc:
+            # The upload is confirmed; a lost state file only means a same-run restart re-ships
+            # these bytes, which consolidation de-duplicates.
+            logger.error("could not save publish state: %s", scrub(str(exc)))
         logger.info("shipped %s: %d files, %d bytes", name, len(chosen), total)
         return True
 
@@ -524,12 +556,17 @@ class Consolidator:
     """Builds and publishes one immutable archive per closed day."""
 
     def __init__(self, data_dir: Path, releases: ReleaseClient, run_id: str, *,
-                 consolidated: set[str] | None = None, lock: threading.Lock | None = None):
+                 consolidated: set[str] | None = None, lock: threading.Lock | None = None,
+                 archived: dict[str, int] | None = None):
         self.data_dir, self.releases, self.run_id = Path(data_dir), releases, run_id
         self.consolidated = consolidated if consolidated is not None else set()
+        self.archived = archived if archived is not None else {}
         self.lock = lock or threading.Lock()
         self._month_assets: dict[str, dict[str, AssetInfo]] = {}
         self._escalated: set[str] = set()
+        self._failures: dict[str, int] = {}
+        self._retry_at: dict[str, datetime] = {}
+        self._local_sizes: dict[str, int] = {}   # set by build_day, consumed by consolidate_day (one pass at a time)
 
     def staging_segments(self) -> list[SegmentInfo]:
         """Confirmed segments only: the Shipper re-ships the bytes of an interrupted
@@ -582,11 +619,13 @@ class Consolidator:
                     contributions.append(Contribution(manifest["run_id"], (seg.stamp, seg.seq), entry["path"],
                                                       int(entry["offset"]), data, seg.name))
             build.sources.append(seg.name)
+        self._local_sizes = {}
         for rel in scan_archive_files(self.data_dir):
             if day_of(rel) == day:
                 build.local_run = True
-                contributions.append(Contribution(self.run_id, ("~local", 0), rel, 0,
-                                                  (self.data_dir / rel).read_bytes(), "local"))
+                data = (self.data_dir / rel).read_bytes()
+                self._local_sizes[rel] = len(data)
+                contributions.append(Contribution(self.run_id, ("~local", 0), rel, 0, data, "local"))
         if not contributions:
             raise RuntimeError(f"no data found for {day}")
         append_only: dict[str, dict[str, list[Contribution]]] = {}
@@ -644,6 +683,8 @@ class Consolidator:
         self._month_assets.pop(tag, None)
         with self.lock:
             self.consolidated.add(day)
+            for rel, size in self._local_sizes.items():
+                self.archived[rel] = max(self.archived.get(rel, 0), size)
         if manifest["gaps"]:
             logger.warning("%s consolidated with %d gap(s)", day, len(manifest["gaps"]))
         logger.info("consolidated %s: %d members, %d observations, %d duplicate lines dropped",
@@ -671,18 +712,29 @@ class Consolidator:
 
     def run(self, now_utc: datetime | None = None) -> dict:
         now_utc = now_utc or datetime.now(timezone.utc)
-        summary: dict[str, Any] = {"consolidated": [], "failed": [], "deleted_segments": 0}
+        summary: dict[str, Any] = {"consolidated": [], "failed": [], "deferred": [], "deleted_segments": 0}
         state_dir = self.data_dir / ".state"
         state_dir.mkdir(parents=True, exist_ok=True)
         for day in self.candidate_days(now_utc):
+            retry_at = self._retry_at.get(day)
+            if retry_at is not None and now_utc < retry_at:
+                summary["deferred"].append(day)   # backing off: no re-download of every segment each pass
+                continue
             with tempfile.TemporaryDirectory(prefix=".tmp-consolidate-", dir=state_dir) as tmp:
                 try:
                     self.consolidate_day(day, Path(tmp))
                     summary["consolidated"].append(day)
+                    self._failures.pop(day, None)
+                    self._retry_at.pop(day, None)
                 except Exception as exc:
-                    logger.error("consolidation of %s failed, will retry: %s", day, scrub(str(exc)))
+                    failures = self._failures.get(day, 0) + 1
+                    self._failures[day] = failures
+                    delay = min(RETRY_BASE * 2 ** (failures - 1), RETRY_CAP)
+                    self._retry_at[day] = now_utc + delay
+                    logger.error("consolidation of %s failed (attempt %d, next try in %s): %s",
+                                 day, failures, delay, scrub(str(exc)))
                     summary["failed"].append(day)
-        for day in summary["failed"]:
+        for day in summary["failed"] + summary["deferred"]:
             if now_utc >= closing_time(day) + STUCK_AFTER and day not in self._escalated:
                 self._escalated.add(day)
                 message = (f"day {day} is still not consolidated {STUCK_AFTER.total_seconds()/3600:g} h after "
@@ -707,9 +759,11 @@ class Publisher:
         self.run_id = run_id or default_run_id()
         self.lock = threading.Lock()
         self.consolidated: set[str] = set()
-        self.shipper = Shipper(self.data_dir, self.releases, self.run_id, consolidated=self.consolidated, lock=self.lock)
+        self.archived: dict[str, int] = {}
+        self.shipper = Shipper(self.data_dir, self.releases, self.run_id,
+                               consolidated=self.consolidated, lock=self.lock, archived=self.archived)
         self.consolidator = Consolidator(self.data_dir, self.releases, self.run_id,
-                                         consolidated=self.consolidated, lock=self.lock)
+                                         consolidated=self.consolidated, lock=self.lock, archived=self.archived)
         self._thread: threading.Thread | None = None
 
     def ship(self, now_utc: datetime | None = None) -> bool:

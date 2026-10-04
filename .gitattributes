@@ -1,0 +1,7 @@
+# Registries are named by the SHA-256 of their bytes and data files are diffed by line:
+# every checkout must see the same LF bytes, whatever core.autocrlf says.
+* text=auto eol=lf
+*.png binary
+*.tar.xz binary
+*.gz binary
+*.sqlite3 binary

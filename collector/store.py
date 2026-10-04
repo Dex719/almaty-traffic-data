@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 import tempfile
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
@@ -80,7 +81,7 @@ def append_score_row(
     else:
         path = data_dir / "scores.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
-    is_new = not path.exists()
+    is_new = not path.exists() or path.stat().st_size == 0   # a kill before the first row leaves an empty file
     with path.open("a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=SCORE_FIELDS)
         if is_new:
@@ -215,6 +216,26 @@ def fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def sweep_temporary(data_dir: Path) -> int:
+    """Remove ``.tmp-*`` files and directories and unsent segment work files.
+
+    Atomic writers delete their temp file in ``finally``; a SIGKILL or a power loss
+    skips that, and an 18 MB ``.tmp-*`` next to the registry would otherwise stay
+    forever. Call only while holding the process lock: every leftover is ours.
+    """
+    removed = 0
+    for path in list(Path(data_dir).rglob(".tmp-*")) + list((Path(data_dir)/".state/segments").glob("*")):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+        removed += 1
+    return removed
 
 
 def atomic_json(path: Path, value: Any) -> None:

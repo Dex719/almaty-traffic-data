@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import tempfile
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,8 +118,8 @@ class Journal:
             if path.exists():
                 try:
                     valid = hashlib.sha256(gzip.decompress(path.read_bytes())).hexdigest() == digest
-                except (OSError, EOFError):
-                    pass
+                except (OSError, EOFError, zlib.error):
+                    pass   # damaged batch file: rewrite it from the recorded body
             if not valid:
                 atomic_bytes(path, gzip.compress(content, mtime=0))
             with self.db:

@@ -133,6 +133,13 @@ class NamingTests(unittest.TestCase):
             self.assertEqual(publish.default_run_id(), "123")
         self.assertEqual(parse_segment_name(segment_name(CLOSED, "123_2", 0, [DAY])).run_id, "123_2")
 
+    def test_invalid_calendar_days_are_ignored(self):
+        self.assertIsNone(day_of("snapshots/2026-02/30.jsonl"))
+        self.assertIsNone(day_of("jam_map/v2/2026-13-01.csv"))
+        self.assertIsNone(day_of("observations/2026-00-10/" + "a"*64 + ".jsonl.gz"))
+        self.assertIsNone(parse_segment_name(segment_name(CLOSED, "run", 0, ["2026-02-30"])))
+        self.assertEqual(day_of("snapshots/2026-02/28.jsonl"), "2026-02-28")
+
     def test_day_of_recognises_only_archive_streams(self):
         self.assertEqual(day_of("observations/2026-09-16/abc.jsonl.gz"), "2026-09-16")
         self.assertEqual(day_of("snapshots/2026-09/16.jsonl"), "2026-09-16")
@@ -311,7 +318,22 @@ class ConsolidatorTests(unittest.TestCase):
         self.releases.fail_upload = True
         self.assertEqual(consolidator.run(CLOSED)["failed"], [DAY])
         self.releases.fail_upload = False
-        self.assertEqual(consolidator.run(CLOSED)["consolidated"], [DAY])
+        self.assertEqual(consolidator.run(CLOSED+timedelta(minutes=15))["consolidated"], [DAY])
+
+    def test_failed_day_backs_off_between_passes(self):
+        local = self.run_dir("c")
+        append(local, f"jam_map/v2/{DAY}.csv", "h\n")
+        consolidator = Consolidator(local, self.releases, "runC")
+        self.releases.fail_upload = True
+        with patch.object(consolidator, "build_day", wraps=consolidator.build_day) as builds:
+            self.assertEqual(consolidator.run(CLOSED)["failed"], [DAY])                       # attempt 1
+            self.assertEqual(consolidator.run(CLOSED+timedelta(minutes=5))["deferred"], [DAY])
+            self.assertEqual(consolidator.run(CLOSED+timedelta(minutes=15))["failed"], [DAY])  # attempt 2: +15 min
+            self.assertEqual(consolidator.run(CLOSED+timedelta(minutes=30))["deferred"], [DAY])
+            self.assertEqual(consolidator.run(CLOSED+timedelta(minutes=45))["failed"], [DAY])  # attempt 3: +30 min
+            self.assertEqual(builds.call_count, 3)
+        self.releases.fail_upload = False
+        self.assertEqual(consolidator.run(CLOSED+timedelta(hours=2))["consolidated"], [DAY])   # attempt 4: +60 min
 
     def test_gap_and_partial_line_are_recorded_not_fatal(self):
         run_a = self.run_dir("a")
@@ -382,7 +404,7 @@ class ConsolidatorTests(unittest.TestCase):
         self.releases.interrupt_at = CLOSED
         self.assertEqual(consolidator.run(CLOSED)["failed"], [DAY])
         self.assertEqual(self.releases.list_assets(month_tag(DAY))[day_asset(DAY)].state, "starter")
-        self.assertEqual(consolidator.run(CLOSED)["consolidated"], [DAY])
+        self.assertEqual(consolidator.run(CLOSED+timedelta(minutes=15))["consolidated"], [DAY])  # after the backoff
         self.assertEqual(self.releases.list_assets(month_tag(DAY))[day_asset(DAY)].state, "uploaded")
 
     def test_stuck_day_is_annotated_once(self):
@@ -401,6 +423,24 @@ class ConsolidatorTests(unittest.TestCase):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_late_bytes_for_an_archived_day_are_reported_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)/"data"
+            data.mkdir()
+            rel = f"jam_map/v2/{DAY}.csv"
+            append(data, rel, "h\n1\n")
+            publisher = Publisher(data, FakeReleases(), run_id="run")
+            self.assertEqual(publisher.consolidator.run(CLOSED)["consolidated"], [DAY])
+            with self.assertNoLogs("collector.publish", level="WARNING"):
+                self.assertEqual(publisher.shipper.pending(CLOSED), [], "local bytes went into the archive")
+            append(data, rel, "2\n")
+            with self.assertLogs("collector.publish", level="WARNING") as logs:
+                self.assertEqual(publisher.shipper.pending(CLOSED), [])
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("2 bytes newer", logs.output[0])
+            with self.assertNoLogs("collector.publish", level="WARNING"):
+                publisher.shipper.pending(CLOSED)
+
     def test_background_consolidation_runs_once_at_a_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)/"data"
@@ -416,6 +456,18 @@ class PublisherTests(unittest.TestCase):
 
 
 class GhClientTests(unittest.TestCase):
+    def test_release_lookup_distinguishes_404_from_other_errors(self):
+        def run_with(stderr):
+            def fake_run(cmd, **kwargs):
+                return subprocess.CompletedProcess(cmd, 1, "", stderr)
+            with patch.object(subprocess, "run", side_effect=fake_run):
+                return publish.GhReleases(repo="o/r")._release("data-2026-09")
+        self.assertIsNone(run_with("gh: Not Found (HTTP 404)"))
+        with self.assertRaises(publish.GhError):
+            run_with("gh: API rate limit exceeded for installation ID 8834043 (HTTP 403)")
+        with self.assertRaises(publish.GhError):
+            run_with("gh: Not Found in cache, retry later (HTTP 502)")
+
     def test_commands_env_and_secret_scrubbing(self):
         seen = []
         def fake_run(cmd, **kwargs):
