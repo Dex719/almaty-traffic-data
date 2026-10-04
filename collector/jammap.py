@@ -91,6 +91,12 @@ def fetch_tiles(client=None, *, grid=None, workers=4, budget=120.0,
     stop, lock = threading.Event(), threading.Lock()
     next_request = [0.0]
     rate_error = []
+    misses = Counter()   # why tiles came back empty: the only way to tell a CDN miss from a block
+
+    def miss(xy, reason):
+        with lock:
+            misses[reason] += 1
+        return xy, None
 
     def fetch(xy):
         with lock:
@@ -111,21 +117,23 @@ def fetch_tiles(client=None, *, grid=None, workers=4, budget=120.0,
                 # 401/403 pause the map for an hour, 429/503 honour Retry-After. Returning
                 # None here would mean a second request per tile and a 10-minute cooldown.
                 response.raise_for_status()
-            if response.status_code != 200 or len(response.content) > 2_000_000:
-                return xy, None
+            if response.status_code != 200:
+                return miss(xy, f"HTTP {response.status_code}")
+            if len(response.content) > 2_000_000:
+                return miss(xy, "oversized")
             if not response.content.startswith(b"\x89PNG\r\n\x1a\n"):
-                return xy, None
+                return miss(xy, "not PNG")
             with Image.open(io.BytesIO(response.content)) as image:
                 if image.size != (256, 256):
-                    return xy, None
+                    return miss(xy, f"size {image.size[0]}x{image.size[1]}")
                 return xy, image.convert("RGBA")
         except httpx.HTTPStatusError as exc:
             with lock:
                 rate_error.append(exc)
             stop.set()
             return xy, None
-        except (httpx.HTTPError, UnidentifiedImageError, OSError, ValueError):
-            return xy, None
+        except (httpx.HTTPError, UnidentifiedImageError, OSError, ValueError) as exc:
+            return miss(xy, type(exc).__name__)
 
     tiles = {}
     pool = ThreadPoolExecutor(max_workers=workers)
@@ -142,8 +150,12 @@ def fetch_tiles(client=None, *, grid=None, workers=4, budget=120.0,
         if missing and tiles and not stop.is_set() and time.monotonic() < deadline:
             # One retry pass: a handful of transient misses must not mark the frame partial.
             # Nothing at all (HTML instead of PNG, captcha) is not a handful: no second pass.
-            logger.info("retrying %d missing tiles", len(missing))
+            logger.info("retrying %d missing tiles (%s)", len(missing), dict(misses))
             collect([pool.submit(fetch, xy) for xy in missing], deadline-time.monotonic())
+            still = [xy for xy in missing if xy not in tiles]
+            if still:
+                logger.info("%d tiles still missing after retry: %s", len(still),
+                            ", ".join(f"{x}/{y}" for x, y in still[:8]))
     except TimeoutError:
         logger.warning("tile acquisition budget exceeded")
     finally:
