@@ -123,6 +123,16 @@ def read_archive(data):
 
 
 class NamingTests(unittest.TestCase):
+    def test_run_id_carries_the_rerun_attempt(self):
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}):
+            self.assertEqual(publish.default_run_id(), "123_2")
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}):
+            self.assertEqual(publish.default_run_id(), "123")
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "123"}):
+            os.environ.pop("GITHUB_RUN_ATTEMPT", None)
+            self.assertEqual(publish.default_run_id(), "123")
+        self.assertEqual(parse_segment_name(segment_name(CLOSED, "123_2", 0, [DAY])).run_id, "123_2")
+
     def test_day_of_recognises_only_archive_streams(self):
         self.assertEqual(day_of("observations/2026-09-16/abc.jsonl.gz"), "2026-09-16")
         self.assertEqual(day_of("snapshots/2026-09/16.jsonl"), "2026-09-16")
