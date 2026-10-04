@@ -24,7 +24,7 @@ from pathlib import Path
 from collector import sources, store
 from collector.journal import Journal
 from collector.ops import exclusive_collector, health_report, notify_systemd, ping_heartbeat
-from collector.publish import ARCHIVE_PATHS, LIVE_PATHS, scrub
+from collector.publish import ARCHIVE_PATHS, LIVE_PATHS, annotate, scrub
 
 logger = logging.getLogger("collector.shift")
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -141,6 +141,22 @@ def _poll(function):
     return datetime.now(timezone.utc), result
 
 
+def describe_error(error: BaseException) -> str:
+    """Class, HTTP status and Retry-After only: never a response body or a driver comment."""
+    parts = [type(error).__name__]
+    response = getattr(error, "response", None)
+    if response is not None:
+        parts.append(f"HTTP {response.status_code}")
+        retry = response.headers.get("Retry-After")
+        if retry:
+            parts.append(f"Retry-After {retry}")
+    else:
+        text = scrub(str(error)).strip()
+        if text:
+            parts.append(text[:120])
+    return ", ".join(parts)
+
+
 def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
               git_enabled=False, stop_event=None, once=False) -> int:
     from collector import jammap
@@ -165,11 +181,13 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
     pool, map_pool = ThreadPoolExecutor(max_workers=4), ThreadPoolExecutor(max_workers=1)
     map_future = None
     successes, fatal, publication_ok = 0, False, True
+    ok_counts = {name: 0 for name in states}
     next_export, next_health = started+COMMIT_EVERY_MIN*60, started
     last_push_ok, last_events_commit = started, float("-inf")
 
     def record(name, observed, payload=None, error=None):
         nonlocal successes
+        previous = states[name].get("status")
         source_ts = payload.get("ts") if isinstance(payload, dict) else None
         status = "error" if error is not None else "ok"
         invalid_rows = getattr(payload, "invalid_rows", 0)
@@ -205,6 +223,20 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
             states[name]["last_success"] = store.utc_stamp(observed)
             if status in ("ok", "partial"):
                 successes += 1
+                ok_counts[name] += 1
+        if status != previous:
+            # The journal keeps every failure, but nobody reads it during a shift: the log is the
+            # only place a dead source becomes visible. One line per transition, not per poll.
+            if error is not None:
+                detail = describe_error(error)
+                pause = guards[name].cooldown_until-time.monotonic()
+                if pause > 0:
+                    detail += f"; cooldown {pause:.0f} s"
+                logger.warning("source %s failed: %s", name, detail)
+            elif status not in ("ok", "partial"):
+                logger.warning("source %s degraded: %s", name, status)
+            elif previous not in (None, "starting"):
+                logger.info("source %s recovered: %s", name, status)
         return status
 
     def save_map(future):
@@ -260,7 +292,13 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
                 except Exception as exc:
                     record(name, datetime.now(timezone.utc), error=exc)
                     continue
-                record(name, observed, payload)
+                try:
+                    record(name, observed, payload)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    # A payload the journal cannot encode (NaN, odd types) is that source's
+                    # failure, not the collector's: the other sources of this tick still count.
+                    record(name, observed, error=exc)
+                    continue
                 results[name] = payload
                 observed_times.append(observed)
             if results:
@@ -315,6 +353,13 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
             journal.close()
             sources.close_client()
             notify_systemd("STOPPING=1")
+        dead = sorted(name for name, count in ok_counts.items() if count == 0)
+        if dead:
+            # Exit status stays 0 while any source works (a dead provider must not spawn a
+            # recovery artifact every shift), so the run page has to say it instead.
+            message = f"no successful observation from {', '.join(dead)} during this shift"
+            logger.warning(message)
+            annotate("warning", message)
     return 1 if fatal or not publication_ok or successes == 0 else 0
 
 

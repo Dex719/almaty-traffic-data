@@ -53,6 +53,16 @@ def _get(url: str, params: dict | None = None) -> httpx.Response:
     return resp
 
 
+def _reject_constant(name: str):
+    # json.loads accepts the non-standard NaN/Infinity literals; the journal (allow_nan=False)
+    # does not, so they must fail here, inside the source, not in the collector's main loop.
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
+def _json(resp) -> Any:
+    return resp.json(parse_constant=_reject_constant)
+
+
 def fetch_yandex_score() -> dict[str, Any]:
     """Балл Яндекс.Пробок по Алматы.
 
@@ -88,10 +98,11 @@ def fetch_yandex_score() -> dict[str, Any]:
 def fetch_dgis_score() -> dict[str, Any]:
     """Балл пробок 2ГИС по Алматы: ``{"score": int, "ts": int}``."""
     resp = _get(DGIS_META_URL, {"reg": DGIS_REGION, "time": "", "score": ""})
-    payload = resp.json()
+    payload = _json(resp)
     entry = next((row for row in payload if row.get("id") == DGIS_REGION), None)
     if entry is None or "score" not in entry:
-        raise ValueError(f"jam meta: нет региона {DGIS_REGION} в ответе {payload!r}")
+        # The message may end up in a log line: never embed the response.
+        raise ValueError(f"jam meta: нет региона {DGIS_REGION} в ответе")
     return {"score": int(entry["score"]), "ts": entry.get("time")}
 
 
@@ -156,9 +167,14 @@ def fetch_dgis_layer(layer: str) -> list[dict[str, Any]]:
         raise ValueError("unknown layer")
     resp = _get(DGIS_TUGC_URL.format(layer=layer),
                 {"project": DGIS_PROJECT, "layers": EVENT_TYPES})
-    payload = resp.json()
+    payload = _json(resp)
     if not isinstance(payload, list):
         raise ValueError("event response is not a list")
+    if not payload:
+        # Hundreds of events are always active in Almaty. An empty list is a provider glitch,
+        # not an empty city; accepting it would publish a complete snapshot claiming every
+        # event disappeared and zero counters in the scores CSV.
+        raise ValueError("empty layer response")
     events = {}
     invalid_rows = 0
     for raw in payload:

@@ -85,7 +85,20 @@ def scrub(text: str) -> str:
 
 
 def default_run_id() -> str:
-    raw = os.environ.get("GITHUB_RUN_ID") or f"local-{socket.gethostname()}-{os.getpid()}"
+    """GITHUB_RUN_ID plus the attempt number when it is not the first.
+
+    A re-run ("Re-run failed jobs") keeps the run id. If it also kept the run_id used in
+    segment names, the consolidator would treat the previous attempt's segments as its own
+    (skipped as covered by local files, then deleted) or glue both attempts' append-only
+    byte ranges into one stream. First attempts keep their historical names.
+    """
+    raw = os.environ.get("GITHUB_RUN_ID")
+    if raw:
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+        if attempt not in ("", "1"):
+            raw = f"{raw}_{attempt}"
+    else:
+        raw = f"local-{socket.gethostname()}-{os.getpid()}"
     return re.sub(r"[^A-Za-z0-9_]", "_", raw)
 
 

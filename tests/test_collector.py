@@ -30,7 +30,7 @@ class FakeResponse:
         self.text = text
         self._payload = payload
 
-    def json(self):
+    def json(self, **kwargs):
         return self._payload
 
     def raise_for_status(self):

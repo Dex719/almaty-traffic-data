@@ -17,8 +17,8 @@ fileMatchPattern: 'requirements*.txt|tests/*.py|.github/workflows/*.yml|deploy/*
 | Переменная | Где | Назначение |
 |---|---|---|
 | `GH_TOKEN`, `GH_REPO` | Actions (шаг сбора), операторский CLI | Доступ `gh` к Releases; локально `gh` авторизован через keyring, достаточно `GH_REPO` |
-| `GITHUB_RUN_ID` | Actions | `run_id` сегментов; локально — `local_<host>_<pid>` или `--run-id` |
-| `TRAFFIC_HEARTBEAT_URL` | сервер (`/etc/almaty-traffic.env`) | внешний dead-man-switch, только HTTPS |
+| `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT` | Actions | `run_id` сегментов (`<run_id>` или `<run_id>_<attempt>` при повторной попытке); локально — `local_<host>_<pid>` или `--run-id` |
+| `TRAFFIC_HEARTBEAT_URL` | сервер (`/etc/almaty-traffic.env`), Actions (secret репозитория, необязателен) | внешний dead-man-switch, только HTTPS |
 | `TRAFFIC_REQUIRE_BACKUP` | сервер | `1` — без свежего backup heartbeat не отправляется |
 
 ## GitHub Actions

@@ -1,4 +1,5 @@
 """Offline regression tests: no live provider calls or production Git writes."""
+import csv
 import gzip
 import io
 import json
@@ -9,10 +10,12 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 from PIL import Image
 from collector import jammap, journal, ops, shift, sources, store
 
@@ -87,7 +90,7 @@ class HardeningTests(unittest.TestCase):
     def test_bad_event_does_not_drop_valid_event(self):
         raw = {"id": "valid", "type": "crash", "location": {"type": "Point", "coordinates": [76.9,43.25]}}
         malformed = {"id": "bad", "type": "restriction", "location": {"type": "MultiPoint", "coordinates": [[]]}}
-        response = SimpleNamespace(json=lambda: [malformed, raw])
+        response = SimpleNamespace(json=lambda **kwargs: [malformed, raw])
         with patch.object(sources, "_get", return_value=response):
             result = sources.fetch_dgis_layer("user")
         self.assertEqual(len(result), 1)
@@ -96,7 +99,7 @@ class HardeningTests(unittest.TestCase):
 
     def test_invalid_container_is_quarantined(self):
         raw = {"id":"bad", "type":"crash", "location": [1,2]}
-        with patch.object(sources, "_get", return_value=SimpleNamespace(json=lambda:[raw])):
+        with patch.object(sources, "_get", return_value=SimpleNamespace(json=lambda **kwargs: [raw])):
             with self.assertRaises(ValueError):
                 sources.fetch_dgis_layer("user")
 
@@ -342,3 +345,86 @@ class HardeningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SilentFailureTests(unittest.TestCase):
+    """collector-silent-failures-bugfix: a dead source must be visible, poison input must stay local."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.data = Path(self.temp.name)/"data"
+        self.data.mkdir()
+        self.now = int(time.time())
+
+    def test_source_failure_is_logged_once_and_dead_source_annotated(self):
+        error = httpx.HTTPStatusError("forbidden", request=httpx.Request("GET", "https://example.test/"),
+                                      response=httpx.Response(403, headers={"Retry-After": "120"}))
+        out = io.StringIO()
+        with patch.object(sources, "fetch_yandex_score", side_effect=error), \
+             patch.object(sources, "fetch_dgis_score", return_value={"score": 1, "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([EVENT])), \
+             patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(out), \
+             self.assertLogs("collector.shift", level="WARNING") as logs:
+            code = shift.run_shift(1, self.data, once=True)
+        self.assertEqual(code, 0)  # the other sources worked; the run page carries the warning
+        failures = [line for line in logs.output if "source yandex failed" in line]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("HTTP 403", failures[0])
+        self.assertIn("Retry-After 120", failures[0])
+        self.assertIn("cooldown", failures[0])
+        annotations = [line for line in out.getvalue().splitlines() if line.startswith("::warning::")]
+        self.assertEqual(len(annotations), 1)
+        self.assertIn("yandex", annotations[0])
+        self.assertNotIn("dgis", annotations[0])
+
+    def test_healthy_shift_has_no_warnings(self):
+        out = io.StringIO()
+        with patch.object(sources, "fetch_yandex_score", return_value={"score": 2, "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_score", return_value={"score": 1, "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([EVENT])), \
+             patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(out):
+            with self.assertNoLogs("collector.shift", level="WARNING"):
+                self.assertEqual(shift.run_shift(1, self.data, once=True), 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_poison_payload_is_only_that_sources_failure(self):
+        with patch.object(sources, "fetch_yandex_score", return_value={"score": 3, "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_score", return_value={"score": float("nan"), "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([EVENT])):
+            code = shift.run_shift(1, self.data, once=True)
+        self.assertEqual(code, 0)
+        rows = list(csv.DictReader(io.StringIO(next((self.data/"scores").glob("*.csv")).read_text(encoding="utf-8"))))
+        self.assertEqual((rows[0]["yandex_score"], rows[0]["dgis_score"]), ("3", ""))
+        db = sqlite3.connect(self.data/".state/journal.sqlite3")
+        try:
+            documents = [json.loads(row[0]) for row in db.execute("SELECT document FROM observations WHERE source='dgis'")]
+        finally:
+            db.close()
+        self.assertEqual([(d["status"], d["error_code"]) for d in documents], [("error", "ValueError")])
+        exported = [json.loads(line) for path in (self.data/"observations").rglob("*.gz")
+                    for line in gzip.decompress(path.read_bytes()).decode().splitlines()]
+        self.assertTrue(any(d["source"] == "yandex" and d["status"] == "ok" for d in exported))
+
+    def test_empty_layer_response_is_an_error(self):
+        with patch.object(sources, "_get", return_value=SimpleNamespace(json=lambda **kwargs: [])):
+            with self.assertRaises(ValueError):
+                sources.fetch_dgis_layer("user")
+
+    def test_non_finite_json_constants_are_rejected_inside_the_source(self):
+        events = ('[{"id":"a","type":"crash","location":{"type":"Point","coordinates":[76.9,43.25]},'
+                  '"feedbacks":{"likes":NaN}}]')
+        meta = '[{"id":67,"score":Infinity,"time":1}]'
+        for text, call in ((events, lambda: sources.fetch_dgis_layer("user")), (meta, sources.fetch_dgis_score)):
+            fake = SimpleNamespace(json=lambda t=text, **kwargs: json.loads(t, **kwargs))
+            with patch.object(sources, "_get", return_value=fake):
+                with self.assertRaises(ValueError):
+                    call()
+
+    def test_error_description_never_carries_a_response_body(self):
+        error = httpx.HTTPStatusError("boom", request=httpx.Request("GET", "https://example.test/"),
+                                      response=httpx.Response(500, text="<html>driver comment here</html>"))
+        self.assertEqual(shift.describe_error(error), "HTTPStatusError, HTTP 500")
+        leaked = shift.describe_error(ValueError("token ghp_abcdefghijklmnop123 leaked"))
+        self.assertIn("ValueError", leaked)
+        self.assertNotIn("ghp_abcdef", leaked)

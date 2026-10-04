@@ -36,6 +36,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # Optional dead-man switch (HTTPS, no data sent). Pinged once a minute only while every
+          # source is healthy, so a dead provider or a broken chain stops it. Grace >= 20 min.
+          TRAFFIC_HEARTBEAT_URL: ${{ secrets.TRAFFIC_HEARTBEAT_URL }}
         # coreutils `timeout` ends a hung collector as a step *failure*, not a job
         # cancellation: a cancelled job would skip "Queue successor" and break the chain.
         # SIGTERM at 340 min triggers the graceful final export/publication; SIGKILL 5 min later.
