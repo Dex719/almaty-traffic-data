@@ -43,6 +43,7 @@ def notify_systemd(message: str) -> None:
 
 
 PARTIAL_HEALTHY_COVERAGE = 0.95  # jammap "partial" with this geometry coverage still feeds the heartbeat
+MIN_FREE_BYTES = 1 << 30         # the journal grows ~50 MB/day; 100 MiB was two days of headroom
 
 
 def _coverage(state: dict) -> float:
@@ -67,7 +68,7 @@ def health_report(states: dict, now=None, data_dir=None) -> dict:
     storage = {"healthy": True}
     if data_dir is not None:
         storage["free_bytes"] = shutil.disk_usage(data_dir).free
-        storage["healthy"] = storage["free_bytes"] >= 100*1024*1024
+        storage["healthy"] = storage["free_bytes"] >= MIN_FREE_BYTES
         if os.environ.get("TRAFFIC_REQUIRE_BACKUP") == "1":
             try:
                 backup = json.loads((Path(data_dir)/".state/backup.json").read_text())
@@ -103,6 +104,8 @@ def main():
     parser.add_argument("command", choices=["check", "export", "backup"])
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--destination", type=Path)
+    parser.add_argument("--keep", type=int, default=14,
+                        help="backups to retain in --destination (0 = keep all)")
     args = parser.parse_args()
     if args.command == "check":
         try:
@@ -121,7 +124,7 @@ def main():
         if args.command == "export":
             print(journal.export_pending())
         else:
-            print(journal.backup(args.destination))
+            print(journal.backup(args.destination, keep=args.keep))
     finally:
         journal.close()
     return 0

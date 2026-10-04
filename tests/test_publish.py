@@ -574,6 +574,7 @@ class ShiftIntegrationTests(unittest.TestCase):
                  patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([])), \
                  patch.object(publish, "Publisher", FakePublisher), patch.object(shift, "commit_and_push", fake_push):
                 self.assertEqual(shift.run_shift(1, data, once=True, git_enabled=True), 0)
+                # the registry travels only with the final publication of a shift (include_events=True)
                 self.assertEqual(calls, ["init", "ship", ("push", True, False), "close"])
                 calls.clear()
                 self.assertEqual(shift.run_shift(1, data, once=True), 0)

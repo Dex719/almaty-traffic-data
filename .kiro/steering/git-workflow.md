@@ -15,7 +15,7 @@
 
 ## Что коммитит бот
 
-- Только live-представления: `data/scores`, `data/events` (раз в час), `data/jam_map/ways.json`, `data/jam_map/registries`. Архивные потоки идут в Releases и перечислены в `.gitignore`.
+- Только live-представления: `data/scores`, `data/events` (в конце вахты), `data/jam_map/ways.json`, `data/jam_map/registries`. Архивные потоки идут в Releases и перечислены в `.gitignore`.
 - Теги `staging` и `data-YYYY-MM` создаёт сборщик под релизы — не удалять и не двигать; релиз `staging` внутренний.
 
 ## Внедрение изменений в публикацию (cutover)

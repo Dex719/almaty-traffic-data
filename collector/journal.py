@@ -9,6 +9,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -126,21 +127,40 @@ class Journal:
                 self.db.execute("UPDATE export_batches SET sent=1,body='' WHERE digest=?", (digest,))
             total += body.count("\n")
 
-    def backup(self, destination: Path) -> Path:
-        """Consistent, verified SQLite backup; destination should be off-host."""
+    def backup(self, destination: Path, keep: int = 14) -> Path:
+        """Consistent, verified SQLite backup; destination should be off-host.
+
+        The database grows by roughly 50 MB a day and is never pruned, so the copy
+        is compressed in chunks (never read into memory whole) and only the newest
+        ``keep`` backups are retained; ``keep <= 0`` disables pruning.
+        """
         destination.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=destination) as td:
             copy_path = Path(td) / "journal.sqlite3"
-            with sqlite3.connect(copy_path) as target:
+            target = sqlite3.connect(copy_path)
+            try:
                 self.db.backup(target)
                 if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise RuntimeError("backup integrity check failed")
                 count = target.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
-            content = gzip.compress(copy_path.read_bytes(), mtime=0)
-        digest = hashlib.sha256(content).hexdigest()
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        path = destination / f"journal-{stamp}-{digest[:12]}.sqlite3.gz"
-        atomic_bytes(path, content)
+            finally:
+                target.close()
+            packed = Path(td) / "journal.sqlite3.gz"
+            with copy_path.open("rb") as src, packed.open("wb") as raw, \
+                    gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+                dst.close()
+                raw.flush()
+                os.fsync(raw.fileno())
+            digest = hashlib.sha256()
+            with packed.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    digest.update(chunk)
+            digest = digest.hexdigest()
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            path = destination / f"journal-{stamp}-{digest[:12]}.sqlite3.gz"
+            os.replace(packed, path)   # same filesystem: the temp dir lives inside destination
+            fsync_directory(destination)
         atomic_json(path.with_suffix(path.suffix + ".json"),
                     {"sha256": digest, "observations": count, "schema_version": 2,
                      "created_at": utc_stamp(datetime.now(timezone.utc))})
@@ -153,7 +173,21 @@ class Journal:
                 atomic_bytes(target, content)
         atomic_json(self.data_dir/".state/backup.json",
                     {"backed_up_at": utc_stamp(datetime.now(timezone.utc)), "sha256": digest})
+        prune_backups(destination, keep)
         return path
 
     def close(self) -> None:
         self.db.close()
+
+
+def prune_backups(destination: Path, keep: int) -> list[Path]:
+    """Remove all but the newest ``keep`` backups (names sort by their UTC stamp) with their manifests."""
+    if keep <= 0:
+        return []
+    removed = []
+    for path in sorted(Path(destination).glob("journal-*.sqlite3.gz"))[:-keep]:
+        for victim in (path, path.with_suffix(path.suffix + ".json")):
+            if victim.exists():
+                victim.unlink()
+                removed.append(victim)
+    return removed

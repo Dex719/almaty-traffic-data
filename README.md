@@ -13,8 +13,9 @@
 ## English summary
 
 An open, provider-independent dataset of road traffic in Almaty, Kazakhstan:
-Yandex and 2GIS congestion scores every minute, user-reported and official road
-events (crashes, roadworks, closures, driver comments) every five minutes, and a
+the 2GIS congestion score every minute and the Yandex score every four minutes,
+user-reported and official road events (crashes, roadworks, closures, driver
+comments) every five minutes, and a
 categorical jam map on OpenStreetMap road geometries. Providers only show "now";
 this repository keeps a verifiable "always" in its own schema, so the history
 does not depend on any provider's API, terms or availability.
@@ -22,7 +23,7 @@ does not depend on any provider's API, terms or availability.
 - **Live views** (git, `data/`): monthly score CSVs, monthly event registries,
   road geometries. `git clone --depth 1 https://github.com/Dex719/almaty-traffic-data.git`
 - **Full history** (GitHub Releases `data-YYYY-MM`): one `traffic-YYYY-MM-DD.tar.xz`
-  per day with the raw observation journal, event snapshots and jam-map classes,
+  per day with the observation journal, event snapshots and jam-map classes,
   plus `MANIFEST.json` with the SHA-256 of every member. Verify downloads against
   the `digest` field of the GitHub release-assets API. A day is final at
   `D+1 00:45 UTC`.
@@ -37,8 +38,10 @@ The rest of this document is in Russian.
 - **Независимость от провайдеров.** Значения берутся из публичных endpoints
   Яндекса и 2ГИС, но схема данных своя: события с ключами `layer:id`, баллы в CSV,
   классы пробок на геометриях OSM. Источник можно заменить или добавить, история
-  при этом остаётся целой. Сырые ответы источников сохраняются в журнале, поэтому
-  смена формата у провайдера не уничтожает прошлое.
+  при этом остаётся целой. В журнале сохраняется нормализованное наблюдение с
+  полями провайдера (балл, тренд, длина, время провайдера; у событий — все
+  используемые поля), поэтому смена формата у провайдера не ломает историю.
+  Сырые тела ответов не хранятся и не логируются.
 - **Проверяемость.** Каждый пакет наблюдений именуется SHA-256 своего содержимого,
   каждый дневной архив имеет `MANIFEST.json`, каждая загрузка на GitHub
   подтверждается digest из API. Что вы скачали, то и было собрано.
@@ -64,8 +67,9 @@ git clone --depth 1 https://github.com/Dex719/almaty-traffic-data.git
 | Файл | Что внутри | Обновление |
 |---|---|---|
 | `data/scores/YYYY-MM.csv` | балл Яндекса и 2ГИС, тренд, длина затруднений, счётчики активных событий по типам | каждые 15 минут |
-| `data/events/YYYY-MM.json` | реестр событий месяца: тип, координаты, комментарий, `first_seen` / `last_seen` | не чаще раза в час |
+| `data/events/YYYY-MM.json` | реестр событий месяца: тип, координаты, комментарий, `first_seen` / `last_seen` | в конце каждой вахты (4–5 раз в сутки) |
 | `data/jam_map/ways.json`, `data/jam_map/registries/*.json` | геометрии дорог OSM, по которым считаются классы пробок; неизменяемые версии | при изменении |
+| `data/events.json`, `data/scores.csv`, `data/jam_map/2026-09-0*.csv` | замороженные файлы старой схемы (до 2026-09-07): не пополняются и не удаляются | никогда |
 
 ### Полная история (GitHub Releases)
 
@@ -86,7 +90,9 @@ tar -xJf traffic-2026-09-16.tar.xz
 - `jam_map/v2/<day>.csv` — классы пробок `G/Y/R/D` для каждой геометрии каждые
   5 минут (алматинская дата);
 - `MANIFEST.json` — SHA-256 и размер каждого файла, источники, отброшенные
-  дубликаты, разрывы.
+  дубликаты, `gaps` — разрывы смещений внутри одного run при сборке. Промежутки
+  во времени (пересменка, потерянный хвост упавшей вахты) в манифест не
+  попадают: ищите их по `observed_at` в журнале.
 
 Проверка скачанного:
 
@@ -105,9 +111,10 @@ sha256sum traffic-2026-09-16.tar.xz
 import csv, gzip, json, tarfile
 from pathlib import Path
 
-# баллы за месяц
+# баллы за месяц: 2ГИС есть в каждой строке, Яндекс — примерно в каждой четвёртой
 rows = list(csv.DictReader(open("data/scores/2026-09.csv", encoding="utf-8")))
-print(rows[-1]["ts_almaty"], rows[-1]["yandex_score"], rows[-1]["dgis_score"])
+last_yandex = next(row for row in reversed(rows) if row["yandex_score"] != "")
+print(rows[-1]["ts_almaty"], rows[-1]["dgis_score"], last_yandex["ts_almaty"], last_yandex["yandex_score"])
 
 # журнал за день из архива
 with tarfile.open("traffic-2026-09-16.tar.xz", "r:xz") as tar:
@@ -128,9 +135,15 @@ with tarfile.open("traffic-2026-09-16.tar.xz", "r:xz") as tar:
 стабильно, 1 растут), `yandex_jam_km`, `dgis_score`, `ev_crash`, `ev_roadwork`,
 `ev_restriction`, `ev_comment`, `ev_other`. Строка отражает завершившуюся группу
 опросов, не гарантированную минутную сетку. Пустое поле не равно нулю; нулевая
-длина пробок сохраняется как `0.0`. Счётчики событий заполняются только при
-полном результате обоих слоёв событий. Времена — полный ISO 8601 с
-микросекундами; ранние строки сентября 2026 записаны с минутной точностью.
+длина пробок сохраняется как `0.0`. Балл 2ГИС есть в каждой строке, поля
+Яндекса — примерно в каждой четвёртой (опрос раз в 240 с). Значение со
+статусом `stale`, `missing_timestamp` или `invalid_timestamp` в CSV не
+попадает (поле пустое) и остаётся только в журнале. Счётчики событий
+заполняются только при полном результате обоих слоёв событий и считают все
+активные события проекта 2ГИС «almaty», включая помеченные `in_aoi=false`
+(примерно пятая часть ДТП); фильтр по AOI делайте по журналу или реестру.
+Времена — полный ISO 8601 с микросекундами; ранние строки сентября 2026
+записаны с минутной точностью.
 
 ### События (`events`, `snapshots`)
 
@@ -256,7 +269,8 @@ sudo journalctl -u almaty-traffic.service -f
 SIGTERM прекращает новые опросы, дожидается активных задач и выполняет
 финальный экспорт. Нулевой сбор или ошибка финального сохранения дают ненулевой
 код. Оповещение о выключенном сервере должно быть внешним. Health check требует
-минимум 100 МиБ свободного места; с `TRAFFIC_REQUIRE_BACKUP=1` отсутствие
+минимум 1 ГиБ свободного места (журнал растёт примерно на 50 МБ в сутки и не
+очищается: планируйте около 20 ГБ в год); с `TRAFFIC_REQUIRE_BACKUP=1` отсутствие
 проверенной копии или её возраст более 36 часов останавливает heartbeat.
 
 ### Резервные копии и восстановление
@@ -266,8 +280,10 @@ SIGTERM прекращает новые опросы, дожидается ак�
 .venv/bin/python -m collector.ops backup --data-dir /var/lib/almaty-traffic --destination /mnt/traffic-backups
 ```
 
-Backup использует SQLite backup API и `integrity_check`, пишет gzip и SHA-256
-manifest, копирует версии реестров геометрий. Смонтируйте внешнюю файловую
+Backup использует SQLite backup API и `integrity_check`, сжимает копию потоково
+(база в память целиком не читается), пишет gzip и SHA-256 manifest, копирует
+версии реестров геометрий и оставляет в каталоге назначения 14 последних копий
+(`--keep N`, `0` — хранить все). Смонтируйте внешнюю файловую
 систему в `/mnt/traffic-backups` и установите backup service/timer из `deploy/`;
 без mount point задание не запускается. Daily timer допускает потерю до суток —
 для меньшего RPO увеличьте частоту. Восстановление: остановить сервис, проверить
@@ -287,6 +303,8 @@ SHA-256 по manifest, распаковать snapshot в новый `.state/jou
 Такие активы не участвуют в сборке, потому что их байты отгружаются следующим
 сегментом. Через час сборщик удаляет их по id через REST. Если закрытый день не
 собран за 24 часа, в логе вахты появляется ERROR, а на странице run аннотация `::error::`.
+Если API за 10 секунд после загрузки так и не отдал `digest`, актив засчитывается
+по размеру с WARNING в логе; скачанное всё равно проверяйте по `digest`.
 
 Дневной архив неизменяем, поэтому поздние данные в него не добавить. `ship`
 отказывается отгружать файлы уже собранного дня: печатает `refused_days` и
@@ -307,8 +325,9 @@ GH_REPO=Dex719/almaty-traffic-data python -m collector.publish consolidate --dat
 
 - **Новый источник** — адаптер в `collector/sources.py`, возвращающий словарь с
   полезной нагрузкой и `ts` провайдера, плюс запись в расписание `shift.py` и
-  офлайн-тест с фейковым ответом. Сырой ответ должен целиком сохраняться в
-  журнале, производные сводки — отдельно.
+  офлайн-тест с фейковым ответом. Нормализованный payload с временем провайдера
+  (`ts`) целиком сохраняется в журнале, производные сводки — отдельно; сырые
+  тела ответов не хранятся и не логируются.
 - **Изменение схемы** — только новым файлом или каталогом (как `jam_map/v2`);
   старые файлы замораживаются, не переписываются.
 - Работа ведётся через спеки в `.kiro/specs/` (Kiro-формат), контекст проекта —

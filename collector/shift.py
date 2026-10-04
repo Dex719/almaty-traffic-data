@@ -30,7 +30,7 @@ logger = logging.getLogger("collector.shift")
 REPO_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_DIR/"data"
 DGIS_EVERY_MIN, YANDEX_EVERY_MIN, EVENTS_EVERY_MIN = 1, 4, 5
-JAMMAP_EVERY_MIN, COMMIT_EVERY_MIN, EVENTS_COMMIT_EVERY_MIN = 5, 15, 60
+JAMMAP_EVERY_MIN, COMMIT_EVERY_MIN = 5, 15
 FAILS_TO_COOLDOWN, COOLDOWN_MIN = 3, 10
 GIT_TIMEOUT_SEC, GIT_NETWORK_TIMEOUT_SEC, PUSH_STALL_MIN = 20, 60, 45
 INTERVALS = {"dgis": 60, "yandex": 240, "events_user": 300, "events_2gis": 300, "jammap": 300}
@@ -85,7 +85,9 @@ def commit_and_push(*, include_events: bool = True, drop_archive: bool = False) 
     Archive streams travel through Releases (collector.publish). ``drop_archive``
     removes their historical copies from the index once everything local has
     been shipped; the files stay on disk. ``include_events`` lets the caller
-    throttle the multi-megabyte event registry to hourly commits.
+    commit the multi-megabyte event registry once per shift: every version of it
+    is a new delta in git history, and hourly commits grew the repository by
+    ~30 MB a week.
     """
     deadline = time.monotonic()+120
     def run(*args):
@@ -117,7 +119,7 @@ def commit_and_push(*, include_events: bool = True, drop_archive: bool = False) 
         logger.error("Git publication requires an upstream tracking branch")
         return False
     for attempt in range(3):
-        # --autostash: unstaged live views (e.g. the registry between hourly commits)
+        # --autostash: unstaged live views (e.g. the registry between shift-final commits)
         # must not block the rebase.
         if run("pull", "--rebase", "--autostash").returncode:
             run("rebase", "--abort")
@@ -171,6 +173,8 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
               for name, interval in INTERVALS.items()}
     map_enabled = (data_dir/"jam_map/ways.json").exists()
     if not map_enabled:
+        # On a server ways.json is a manual copy; forgetting it must not look healthy in silence.
+        logger.warning("jam map disabled: %s not found", data_dir/"jam_map/ways.json")
         states.pop("jammap")
     started = time.monotonic()
     deadline = float("inf") if minutes is None else started+minutes*60
@@ -183,7 +187,7 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
     successes, fatal, publication_ok = 0, False, True
     ok_counts = {name: 0 for name in states}
     next_export, next_health = started+COMMIT_EVERY_MIN*60, started
-    last_push_ok, last_events_commit = started, float("-inf")
+    last_push_ok = started
 
     def record(name, observed, payload=None, error=None):
         nonlocal successes
@@ -250,13 +254,10 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
 
     def publish(final=False):
         """Segments first (Releases), then live views (git); consolidation in the background."""
-        nonlocal publication_ok, last_push_ok, last_events_commit
+        nonlocal publication_ok, last_push_ok
         shipped = publisher.ship() if publisher is not None else True
-        include_events = final or time.monotonic()-last_events_commit >= EVENTS_COMMIT_EVERY_MIN*60
         drop_archive = publisher.fully_shipped() if publisher is not None else False
-        pushed = commit_and_push(include_events=include_events, drop_archive=drop_archive)
-        if pushed and include_events:
-            last_events_commit = time.monotonic()
+        pushed = commit_and_push(include_events=final, drop_archive=drop_archive)
         publication_ok = shipped and pushed
         if publication_ok:
             last_push_ok = time.monotonic()
@@ -269,8 +270,8 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
         while time.monotonic() < deadline and not stop.is_set():
             now = time.monotonic()
             if map_future is not None and map_future.done():
-                save_map(map_future)
-                map_future = None
+                map_future, finished = None, map_future
+                save_map(finished)
             ready = []
             for name in due:
                 if now < due[name]:
@@ -293,11 +294,15 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
                     record(name, datetime.now(timezone.utc), error=exc)
                     continue
                 try:
-                    record(name, observed, payload)
+                    status = record(name, observed, payload)
                 except (ValueError, TypeError, OverflowError) as exc:
                     # A payload the journal cannot encode (NaN, odd types) is that source's
                     # failure, not the collector's: the other sources of this tick still count.
                     record(name, observed, error=exc)
+                    continue
+                if status not in ("ok", "partial"):
+                    # stale / missing or invalid provider timestamp: kept in the journal with its
+                    # status, but the live CSV has no status column, so it must not pose as fresh.
                     continue
                 results[name] = payload
                 observed_times.append(observed)
@@ -337,16 +342,24 @@ def run_shift(minutes: int | None, data_dir: Path = DATA_DIR, *,
         # No daemon writer can outlive this final export/publication.
         pool.shutdown(wait=True, cancel_futures=True)
         map_pool.shutdown(wait=True, cancel_futures=True)
+        def final_step(name, function):
+            # One failing step (e.g. a full disk under the map CSV) must not skip the export
+            # and the publication that would save the rest of the shift.
+            nonlocal fatal
+            try:
+                function()
+            except Exception:
+                logger.exception("Final %s failed", name)
+                fatal = True
+
         try:
             if map_future is not None and not map_future.cancelled():
-                save_map(map_future)
-            journal.export_pending()
+                final_step("map frame", lambda: save_map(map_future))
+            final_step("export", journal.export_pending)
             if git_enabled:
-                publish(final=True)
-            store.atomic_json(data_dir/".state/health.json", health_report(states, data_dir=data_dir))
-        except Exception:
-            logger.exception("Final persistence/publication failed")
-            fatal = True
+                final_step("publication", lambda: publish(final=True))
+            final_step("health report", lambda: store.atomic_json(
+                data_dir/".state/health.json", health_report(states, data_dir=data_dir)))
         finally:
             if publisher is not None:
                 publisher.close()

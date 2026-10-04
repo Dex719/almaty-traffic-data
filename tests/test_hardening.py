@@ -1,6 +1,7 @@
 """Offline regression tests: no live provider calls or production Git writes."""
 import csv
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -384,8 +385,11 @@ class SilentFailureTests(unittest.TestCase):
              patch.object(sources, "fetch_dgis_score", return_value={"score": 1, "ts": self.now}), \
              patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([EVENT])), \
              patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), redirect_stdout(out):
-            with self.assertNoLogs("collector.shift", level="WARNING"):
+            with self.assertLogs("collector.shift", level="INFO") as logs:
                 self.assertEqual(shift.run_shift(1, self.data, once=True), 0)
+        warnings = [line for line in logs.output if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("jam map disabled", warnings[0])   # no ways.json in this test
         self.assertEqual(out.getvalue(), "")
 
     def test_poison_payload_is_only_that_sources_failure(self):
@@ -457,3 +461,73 @@ class ChainAndTilesTests(unittest.TestCase):
         tiles = jammap.fetch_tiles(Client(), grid=[(0, 0), (1, 0)], min_interval=0, workers=1)
         self.assertEqual(tiles, {})
         self.assertEqual(len(calls), 2)
+
+
+class SecondTierTests(unittest.TestCase):
+    """collector-audit-second-tier: stale values, final steps, backups, registry commits."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.data = Path(self.temp.name)/"data"
+        self.data.mkdir()
+        self.now = int(time.time())
+
+    def test_stale_score_stays_out_of_the_live_csv(self):
+        with patch.object(sources, "fetch_yandex_score", return_value={"score": 4, "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_score", return_value={"score": 9, "ts": self.now-3600}), \
+             patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([EVENT])):
+            self.assertEqual(shift.run_shift(1, self.data, once=True), 0)
+        rows = list(csv.DictReader(io.StringIO(next((self.data/"scores").glob("*.csv")).read_text(encoding="utf-8"))))
+        self.assertEqual((rows[0]["yandex_score"], rows[0]["dgis_score"]), ("4", ""))
+        db = sqlite3.connect(self.data/".state/journal.sqlite3")
+        try:
+            statuses = [row[0] for row in db.execute("SELECT status FROM observations WHERE source='dgis'")]
+        finally:
+            db.close()
+        self.assertEqual(statuses, ["stale"])
+
+    def test_failing_map_write_does_not_skip_export_or_health(self):
+        store.atomic_json(self.data/"jam_map/ways.json",
+                          {"ids": [1], "highway": ["primary"], "polylines": [[[43.25, 76.9], [43.25, 76.91]]]})
+        jammap._prepare.cache_clear()
+        tile = Image.new("RGBA", (256, 256), (80, 200, 90, 255))
+        with patch.object(jammap, "fetch_tiles", side_effect=lambda **kwargs: {xy: tile for xy in kwargs["grid"]}), \
+             patch.object(jammap, "append_frame", side_effect=OSError("disk full")), \
+             patch.object(sources, "fetch_yandex_score", return_value={"score": 4, "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_score", return_value={"score": 1, "ts": self.now}), \
+             patch.object(sources, "fetch_dgis_layer", return_value=sources.EventList([EVENT])):
+            code = shift.run_shift(1, self.data, once=True)
+        self.assertEqual(code, 1)   # the map write failed: fatal, but not before saving everything else
+        self.assertTrue(list((self.data/"observations").rglob("*.gz")), "final export still ran")
+        self.assertTrue((self.data/".state/health.json").exists(), "health report still written")
+        db = sqlite3.connect(self.data/".state/journal.sqlite3")
+        try:
+            frames = db.execute("SELECT COUNT(*) FROM observations WHERE source='jammap'").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(frames, 1, "the frame is journaled once, not replayed in the finally")
+
+    def test_backup_is_streamed_and_pruned(self):
+        log = journal.Journal(self.data)
+        self.addCleanup(log.close)
+        log.record("dgis", NOW, {"score": 1})
+        dest = Path(self.temp.name)/"backup"
+        dest.mkdir()
+        for stamp in ("20260101T000000Z", "20260102T000000Z"):
+            (dest/f"journal-{stamp}-old.sqlite3.gz").write_bytes(b"old")
+            (dest/f"journal-{stamp}-old.sqlite3.gz.json").write_text("{}")
+        with patch.object(journal.gzip, "compress", side_effect=AssertionError("must stream, not buffer")):
+            path = log.backup(dest, keep=2)
+        manifest = json.loads(path.with_suffix(path.suffix + ".json").read_text())
+        self.assertEqual(manifest["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        restored = Path(self.temp.name)/"restore.sqlite3"
+        restored.write_bytes(gzip.decompress(path.read_bytes()))
+        with sqlite3.connect(restored) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM observations").fetchone()[0], 1)
+        names = sorted(p.name for p in dest.glob("journal-*"))
+        self.assertNotIn("journal-20260101T000000Z-old.sqlite3.gz", names)
+        self.assertNotIn("journal-20260101T000000Z-old.sqlite3.gz.json", names)
+        self.assertIn("journal-20260102T000000Z-old.sqlite3.gz", names)
+        self.assertEqual(len([n for n in names if n.endswith(".gz")]), 2)
+        self.assertEqual(journal.prune_backups(dest, 0), [])
