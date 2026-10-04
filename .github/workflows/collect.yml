@@ -32,7 +32,9 @@ jobs:
         run: |
           git config user.name "traffic-bot"
           git config user.email "traffic-bot@users.noreply.github.com"
+          echo "SHIFT_STARTED=$(date +%s)" >> "$GITHUB_ENV"
       - name: Collect with shutdown margin
+        id: collect
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -48,12 +50,34 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: traffic-recovery-${{ github.run_id }}
-          path: data/
+          # The artifact exists for the journal and today's streams; frozen legacy files
+          # (about 15 MB) are already in git and only make a crash loop more expensive.
+          path: |
+            data/
+            !data/events.json
+            !data/scores.csv
+            !data/jam_map/*.csv
           include-hidden-files: true
           retention-days: 14
       - name: Queue successor
         if: always() && !cancelled()
         env:
           GH_TOKEN: ${{ github.token }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+        # A collector that dies within minutes (broken merge, uninstallable pin, poison payload)
+        # must not re-dispatch itself every minute with a recovery artifact each time: pause first.
+        # One failed dispatch call must not break the chain either: retry, then leave it to cron.
         run: |
-          gh api -X POST "/repos/${{ github.repository }}/actions/workflows/collect.yml/dispatches" -f ref=main
+          elapsed=$(( $(date +%s) - ${SHIFT_STARTED:-0} ))
+          if [ "$COLLECT_OUTCOME" != "success" ] && [ "$elapsed" -lt 900 ]; then
+            echo "::error::collector ended with '$COLLECT_OUTCOME' after ${elapsed}s; pausing 10 min before queueing the successor"
+            sleep 600
+          fi
+          for attempt in 1 2 3; do
+            if gh api -X POST "/repos/${{ github.repository }}/actions/workflows/collect.yml/dispatches" -f ref=main; then
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+          echo "::error::could not queue the successor after 3 attempts; the cron schedule has to restart the chain"
+          exit 1
